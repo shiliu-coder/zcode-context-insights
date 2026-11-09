@@ -1,0 +1,8 @@
+{
+  "$comment": "按每百万 token 的美元价格，取自 models.dev 的 zhipuai 条目（2026-11-08 抓取）。用户覆盖：~/.zcode/context-insights/pricing.json 使用相同结构，按 modelId 小写合并替换；contextLimit 为模型上下文窗口，用于占用率计算。套餐类 provider（providerId 含 plan）实际按订阅计费，工具输出会同时标注套餐属性与按量牌价折算值。",
+  "models": {
+    "glm-5.3": { "input": 1.19516, "output": 4.18306, "cacheRead": 0.29879, "cacheWrite": 0, "contextLimit": 1000000 },
+    "glm-5.3-flash": { "input": 0.11952, "output": 0.41831, "cacheRead": 0.03436, "cacheWrite": 0, "contextLimit": 1000000 },
+    "glm-5.3-flashx": { "input": 0.29879, "output": 1.04577, "cacheRead": 0.08516, "cacheWrite": 0, "contextLimit": 1000000 }
+  }
+}

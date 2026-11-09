@@ -1,0 +1,19 @@
+{
+  "name": "shiliu-coder-plugins",
+  "owner": { "name": "shiliu-coder", "url": "https://github.com/shiliu-coder" },
+  "plugins": [
+    {
+      "name": "context-insights",
+      "source": "./context-insights",
+      "version": "1.1.0",
+      "description": "Context composition, per-request trend, cost estimates, cross-session insights, full-text search, CSV export, subagent fleet management and health scoring — read from local ZCode model-IO rollout logs. A ZCode port of the dsh-context data layer.",
+      "displayName": "Context Insights",
+      "displayName_i18n": { "zh-CN": "上下文洞察" },
+      "description_i18n": { "zh-CN": "读取本地 ZCode 模型 IO 日志：上下文组成拆解与工具归因、逐请求趋势与窗口压力投影、跨会话用量洞察与成本估算、全文搜索（含正则）、CSV 导出、子 agent 会话管理与健康度评分（dsh-context 数据层的 ZCode 版）。15 工具 + 4 命令。" },
+      "category": "productivity",
+      "author": "shiliu-coder",
+      "homepage": "https://github.com/shiliu-coder/zcode-context-insights",
+      "repository": { "url": "https://github.com/shiliu-coder/zcode-context-insights", "directory": "context-insights" }
+    }
+  ]
+}
