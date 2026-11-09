@@ -24,10 +24,13 @@ dsh-context 的 ZCode 版数据层移植：读取本地 ZCode 模型 IO 日志�
 | `pricing_refresh` | 从 models.dev 在线刷新价格表到自动层 `pricing-auto.json`（手写 `pricing.json` 优先级更高，永不被覆盖）。**本插件唯一发起网络请求的工具**，仅在用户明确要求"刷新价格"时调用。 |
 
 斜杠命令（安装本插件后可用）：
+- `/dashboard` —— **打开实时上下文看板**（首选入口；宿主支持 UI 资源时以侧栏面板/应用卡片呈现，5 秒自动刷新；不支持时返回摘要并可用 `context_report` 生成 HTML 报表兜底）。
 - `/context` —— 当前会话的中文上下文报告（组成/工具归因/趋势/成本）。
 - `/insights` —— 跨会话用量洞察（默认精简模式，避免长输出；要完整账本请明说）。
 - `/subagents` —— 子 agent 会话一览（状态/父会话/成本）。
 - `/weekly` —— 紧凑周报（KPI/健康度排名/最近会话/建议，≤60 行）。
+
+> 入口说明：当前 ZCode 宿主版本没有插件可注册的右键菜单或常驻侧栏标签 API——`/dashboard` 斜杠命令或对话中说"打开上下文看板"即触发面板。看板工具已按宿主的 side pane 协议（`preferredModelDisplayMode: fullscreen`）声明偏好，宿主后续版本支持时会自动进右侧面板，无需改插件。
 
 所有时间戳与每日/小时分桶均按**本机时区**；走势条图超过 72 点自动降采样。
 
@@ -88,4 +91,6 @@ rollout 历史可达数十 GB。首次调用 `context_trend`/`context_insights`/
 | 1.0.0 | 里程碑：`context_compare` 会话对比、`session_digest` 批量速览（recent:N）、`/weekly` 周报命令；真机 dogfood 验证（60s 刷新在生产会话生效）。14 工具 + 4 命令，功能面收敛 |
 | 1.2.0 | 流量三分与搜索修复：索引 v3 记录 querySource，请求三分（主对话/子 agent/辅助），**健康度评分剔除辅助流**（修复背景小请求拉爆缓存分的评分冤案）；insights 辅助流量 KPI；`context_search` `includeTools`（工具调用输入，稳定分区优先）+ **候选按文件大小升序**（修复巨文件烧光预算饿死小文件）；索引向下兼容（版本升级不再触发全量重建风暴）+ 无 qs 小文件一次性补扫 |
 | 1.3.0 | 可视化：`context_report` 单文件 HTML 报表（KPI 卡/每日柱/热力图/小时分布/健康度排名，深色零外部资源）；insights 聚合逻辑抽为 `collectInsights` 共享层（Markdown/HTML 双渲染，输出逐字节不变） |
-| 1.4.0 | **MCP App 实时看板**：server 声明 `ui://context-insights/dashboard.html` 资源，`dashboard_show` 在 ZCode Desktop 的 App 面板打开看板（每 5 秒 `dashboard_data` 自动刷新，app-only 不进对话）；页面手写 postMessage JSON-RPC（ui/initialize 握手），零依赖；`tools/call` 支持结构化输出。**18 工具 + 4 命令** |
+| 1.4.0 | **MCP App 实时看板**：server 声明 `ui://context-insights/dashboard.html` 资源，`dashboard_show` 打开看板（每 5 秒 `dashboard_data` 自动刷新，app-only 不进对话）；页面手写 postMessage JSON-RPC（ui/initialize 握手），零依赖；`tools/call` 支持结构化输出 |
+| 1.4.1 | 自审打磨：dashboard_data 空数据补 content（协议形状一致）；健康度行补 query 过滤（与 KPI 同口径）；`resources/subscribe` 温和应答；页面 5s 快速降级、错误保留上次内容、手动刷新、空态提示 |
+| 1.5.0 | **右侧面板（dsh-context 右栏的 ZCode 等价物）**：`dashboard_show` 补齐 side pane 配方（`"openai/ui".preferredModelDisplayMode: "fullscreen"` + `visibility ["model","app"]` + `csp` + 结果 `openai/widgetSessionId` 绑定）——调用即在 ZCode Desktop 右侧面板弹出实时看板 |
