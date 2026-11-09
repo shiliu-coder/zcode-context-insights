@@ -55,11 +55,12 @@ test('MCP 握手 + 工具清单 + 真实数据调用 + 搜索 includeTools + 未
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'context_composition', arguments: {} } },
     { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'context_trend', arguments: {} } },
     { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'context_search', arguments: { query: 'cargo test', includeTools: true, range: 'all', limit: 3 } } },
+    { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'context_report', arguments: { range: 'all' } } },
     { jsonrpc: '2.0', id: 6, method: 'bogus/method', params: {} },
   ])
   const byId = Object.fromEntries(out.map(m => [m.id, m]))
   assert.equal(byId[1].result.serverInfo.name, 'context-insights')
-  assert.ok(byId[2].result.tools.length >= 15, `工具数 ${byId[2].result.tools.length}`)
+  assert.ok(byId[2].result.tools.length >= 16, `工具数 ${byId[2].result.tools.length}`)
   const comp = byId[3].result.content[0].text
   assert.ok(comp.includes('上下文组成'), comp.slice(0, 200))
   assert.ok(comp.includes('live1'), '应命中合成会话 live1')
@@ -68,6 +69,8 @@ test('MCP 握手 + 工具清单 + 真实数据调用 + 搜索 includeTools + 未
   const search = byId[5].result.content[0].text
   assert.ok(search.includes('工具调用') && search.includes('Bash'), `includeTools 应命中工具调用输入：\n${search.slice(0, 400)}`)
   assert.ok(search.includes('request=-'))
+  const report = byId[7].result.content[0].text
+  assert.ok(report.includes('.html') && report.includes('exports'), `HTML 报表应落盘 exports/：\n${report.slice(0, 300)}`)
   assert.equal(byId[6].error.code, -32601)
 }, { timeout: 90000 })
 

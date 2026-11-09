@@ -1069,10 +1069,12 @@ function entryTitleOf(entry) {
 
 const RANGES = { today: 1, '7d': 7, '30d': 30, all: Infinity }
 
-async function toolInsights(args = {}, idx) {
+/**
+ * 洞察聚合层（v1.3 从 toolInsights 抽出，供 Markdown/HTML 两种渲染共用）：
+ * 过滤（range/workspace/query）→ 行级标量、模型/工作区分布、每日/小时、会话榜、四账本。
+ */
+function collectInsights(args, idx) {
   const range = RANGES[args.range] ? args.range : '7d'
-  // brief 模式：只出 KPI/模型/工作区/会话榜，跳过每日柱、热力图、小时分布与四类账本——避免长报告挤占会话窗口
-  const brief = args.brief === true
   const days = RANGES[range]
   const cutoff = days === Infinity ? 0 : Date.now() - days * 86400_000
   const wsFilter = typeof args.workspace === 'string' && args.workspace ? args.workspace.replace(/\/+$/, '') : null
@@ -1087,7 +1089,7 @@ async function toolInsights(args = {}, idx) {
     })
     if (reqs.length) rows.push({ sid, ...entry, reqs })
   }
-  if (!rows.length) return `时间范围 ${range}${wsFilter ? ` · 工作区 ${wsFilter}` : ''}${q ? ` · 搜索 "${args.query}"` : ''} 内没有请求记录。`
+  if (!rows.length) return { empty: true, range, wsFilter, q }
   const allReqs = rows.flatMap(r => r.reqs)
   const inTok = sum(allReqs, r => r.in), outTok = sum(allReqs, r => r.out), cr = sum(allReqs, r => r.cr)
   const totalCost = sum(allReqs, requestCostUsd)
@@ -1111,25 +1113,11 @@ async function toolInsights(args = {}, idx) {
     }
     if (n) { compEvents += n; compSessions++ }
   }
-  const lines = []
-  lines.push(`## 上下文洞察（${range}${wsFilter ? ` · 工作区 ${wsDisplay(wsFilter)}` : ''}${q ? ` · "${args.query}"` : ''}）`)
-  lines.push('')
-  lines.push(`- 会话 ${rows.length} 个（子 agent ${rows.filter(r => isSub(r.sid)).length} 个）· 请求 ${allReqs.length} 次`)
-  lines.push(`- 输入 ${fmtTok(inTok)} · 输出 ${fmtTok(outTok)} · 缓存命中 ${fmtTok(cr)}（命中率 ${inTok ? (100 * cr / inTok).toFixed(1) : 'N/A'}%）`)
-  lines.push(`- 成本折算 ${fmtUsd(totalCost)}${priced.length < allReqs.length ? `（${allReqs.length - priced.length} 次请求的模型不在价格表，未计价）` : ''}`
-    + (noCacheCost > 0 && totalCost != null ? ` · 缓存省钱 ${fmtUsd(noCacheCost - totalCost)}（无缓存等值 ${fmtUsd(noCacheCost)}，省 ${noCacheCost > 0 ? Math.round(100 * (1 - totalCost / noCacheCost)) : 0}%）` : ''))
-  lines.push(`- 工具执行 ${fmtInt(sum(allReqs, r => (r.tools || []).length))} 次 · 模型耗时 ${fmtDur(modelMs)} · 活动跨度 ${fmtDur(spanMs)}（非模型时间约 ${fmtDur(Math.max(0, spanMs - modelMs))}）`)
-  lines.push(`- 上下文压缩 ${fmtInt(compEvents)} 次（涉及 ${compSessions} 个会话）`)
-  // 辅助流量三分（v1.2）：后台搜索/标题生成/compact 等隐形请求单独可见
-  const auxRows = []
   let auxN = 0, auxTok = 0
   for (const r of rows) for (const x of r.reqs) {
     if (reqClass(x, r.sid) === 'aux') { auxN++; auxTok += (x.in || 0) + (x.out || 0) }
   }
-  if (auxN) lines.push(`- 辅助请求 ${fmtInt(auxN)} 次 · ${fmtTok(auxTok)} tok（后台搜索/标题生成/compact 等隐形流量，未计入健康度评分）`)
-  lines.push('')
 
-  // 模型分布
   const byModel = new Map()
   for (const r of allReqs) {
     const d = byModel.get(r.model) || { n: 0, in: 0, out: 0, cr: 0, cost: 0, provider: r.provider }
@@ -1137,12 +1125,7 @@ async function toolInsights(args = {}, idx) {
     byModel.set(r.model, d)
   }
   const models = [...byModel.entries()].sort((a, b) => b[1].cost - a[1].cost || b[1].in - a[1].in)
-  lines.push('### 模型分布')
-  lines.push('| 模型 | provider | 请求 | 输入 | 输出 | 缓存命中 | 成本折算 |')
-  lines.push('|---|---|---|---|---|---|---|')
-  for (const [m, d] of models) lines.push(`| ${m ?? 'N/A'} | ${d.provider ?? '-'}${isPlanProvider(d.provider) ? '（套餐）' : ''} | ${d.n} | ${fmtTok(d.in)} | ${fmtTok(d.out)} | ${fmtTok(d.cr)} | ${fmtUsd(d.cost)} |`)
 
-  // 工作区分布：哪个项目最费
   const byWs = new Map()
   for (const r of rows) {
     const key = r.workspace || '(未知)'
@@ -1151,13 +1134,7 @@ async function toolInsights(args = {}, idx) {
     byWs.set(key, d)
   }
   const wsTop = [...byWs.entries()].sort((a, b) => b[1].tok - a[1].tok).slice(0, 8)
-  lines.push('')
-  lines.push('### 工作区分布（前 8，按 token）')
-  lines.push('| 工作区 | 会话 | 请求 | token | 成本折算 |')
-  lines.push('|---|---|---|---|---|')
-  for (const [ws, d] of wsTop) lines.push(`| ${wsDisplay(ws)} | ${d.sessions} | ${d.reqs} | ${fmtTok(d.tok)} | ${fmtUsd(d.cost)} |`)
 
-  // 每日用量（最近 7 个有数据的日子）
   const daily = new Map()
   for (const r of allReqs) {
     if (!r.ts) continue
@@ -1168,78 +1145,21 @@ async function toolInsights(args = {}, idx) {
     daily.set(day, d)
   }
   const days7 = [...daily.entries()].sort((a, b) => a[0].localeCompare(b[0])).slice(-7)
-  if (!brief && days7.length) {
-    lines.push('')
-    lines.push('### 每日用量（近 7 个活跃日）')
-    lines.push('```')
-    const maxTok = Math.max(...days7.map(([, d]) => d.tok), 1)
-    for (const [day, d] of days7) {
-      const bar = '█'.repeat(Math.max(1, Math.round(30 * d.tok / maxTok)))
-      lines.push(`${day} ${bar} ${fmtTok(d.tok)} tok ${fmtUsd(d.cost)}`)
-    }
-    lines.push('```')
-  }
 
-  // 8 周活动热力图（真实日历排布，按窗口内最大日 token 归一；无数据日显示 ·）
-  if (!brief && daily.size > 7) {
-    const maxDayTok = Math.max(...[...daily.values()].map(d => d.tok), 1)
-    const blocks = '▁▂▃▄▅▆▇█'
-    const cell = d => d == null ? '·' : blocks[Math.min(7, Math.floor(8 * d.tok / maxDayTok))]
-    // 从最后一个有数据的日子（本地日期）往前取 55 天，补齐日历
-    const lastDay = [...daily.keys()].sort().pop()
-    const cells = []
-    const cursor = new Date(lastDay + 'T00:00:00')
-    cursor.setDate(cursor.getDate() - 55)
-    for (let i = 0; i < 56; i++) {
-      const key = localDayKey(cursor)
-      cells.push(cell(daily.get(key)?.tok))
-      cursor.setDate(cursor.getDate() + 1)
-    }
-    lines.push('')
-    lines.push('### 活动热力图（近 8 周 · 每行一周，▁→█ 递增，· 无数据）')
-    lines.push('```')
-    for (let w = 0; w < 56; w += 7) lines.push(cells.slice(w, w + 7).join(''))
-    lines.push('```')
-  }
-
-  // 小时分布（本机时区）：什么时段在干活
   const hourly = new Array(24).fill(0)
   for (const r of allReqs) {
     if (!r.ts) continue
     const h = new Date(r.ts).getHours()
     if (h >= 0 && h < 24) hourly[h] += (r.in || 0) + (r.out || 0)
   }
-  if (!brief && hourly.some(v => v > 0)) {
-    const maxH = Math.max(...hourly, 1)
-    lines.push('')
-    lines.push('### 小时分布（本机时区，按 token）')
-    lines.push('```')
-    for (let h = 0; h < 24; h += 12) {
-      const seg = hourly.slice(h, h + 12)
-      lines.push(`${String(h).padStart(2, '0')}-${String(h + 11).padStart(2, '0')}时 ` + seg.map(v => {
-        const blocks = '▁▂▃▄▅▆▇█'
-        return v === 0 ? '·' : blocks[Math.min(7, Math.floor(8 * v / maxH))]
-      }).join(''))
-    }
-    const peakHour = hourly.indexOf(Math.max(...hourly))
-    lines.push(`峰值时段 ${String(peakHour).padStart(2, '0')}:00（${fmtTok(hourly[peakHour])} tok）`)
-    lines.push('```')
-  }
 
-  // 会话榜
   const top = rows.map(r => ({
     sid: r.sid, workspace: r.workspace, title: r.title, n: r.reqs.length,
     tok: sum(r.reqs, x => (x.in || 0) + (x.out || 0)),
     cost: sum(r.reqs, requestCostUsd),
     last: r.reqs.map(x => x.ts).filter(Boolean).sort().pop(),
   })).sort((a, b) => b.tok - a.tok).slice(0, 10)
-  lines.push('')
-  lines.push('### 会话榜（按 token，前 10）')
-  lines.push('| 会话 | 工作区 | 请求 | token | 成本 | 最近活跃 |')
-  lines.push('|---|---|---|---|---|---|')
-  for (const t of top) lines.push(`| ${shortSid(t.sid)}${isSub(t.sid) ? '（子）' : ''} | ${wsDisplay(t.workspace)} | ${t.n} | ${fmtTok(t.tok)} | ${fmtUsd(t.cost)} | ${fmtDate(t.last)} |`)
 
-  // 各类账本（工具/技能/文件/命令）
   const toolLedger = new Map()
   const skillLedger = new Map()
   const fileLedger = new Map()
@@ -1274,6 +1194,105 @@ async function toolInsights(args = {}, idx) {
       }
     }
   }
+  return {
+    empty: false, range, wsFilter, q, rows, allReqs,
+    kpi: {
+      nSessions: rows.length, nSub: rows.filter(r => isSub(r.sid)).length, nReqs: allReqs.length,
+      inTok, outTok, cr, totalCost, unpriced: allReqs.length - priced.length, noCacheCost,
+      toolCalls: sum(allReqs, r => (r.tools || []).length), modelMs, spanMs,
+      compEvents, compSessions, auxN, auxTok,
+    },
+    models, wsTop, daily, days7, hourly, top,
+    toolLedger, skillLedger, fileLedger, cmdLedger,
+  }
+}
+
+async function toolInsights(args = {}, idx) {
+  // brief 模式：只出 KPI/模型/工作区/会话榜，跳过每日柱、热力图、小时分布与四类账本——避免长报告挤占会话窗口
+  const brief = args.brief === true
+  const a = collectInsights(args, idx)
+  if (a.empty) return `时间范围 ${a.range}${a.wsFilter ? ` · 工作区 ${a.wsFilter}` : ''}${a.q ? ` · 搜索 "${args.query}"` : ''} 内没有请求记录。`
+  const { kpi } = a
+  const lines = []
+  lines.push(`## 上下文洞察（${a.range}${a.wsFilter ? ` · 工作区 ${wsDisplay(a.wsFilter)}` : ''}${a.q ? ` · "${args.query}"` : ''}）`)
+  lines.push('')
+  lines.push(`- 会话 ${a.rows.length} 个（子 agent ${kpi.nSub} 个）· 请求 ${kpi.nReqs} 次`)
+  lines.push(`- 输入 ${fmtTok(kpi.inTok)} · 输出 ${fmtTok(kpi.outTok)} · 缓存命中 ${fmtTok(kpi.cr)}（命中率 ${kpi.inTok ? (100 * kpi.cr / kpi.inTok).toFixed(1) : 'N/A'}%）`)
+  lines.push(`- 成本折算 ${fmtUsd(kpi.totalCost)}${kpi.unpriced ? `（${kpi.unpriced} 次请求的模型不在价格表，未计价）` : ''}`
+    + (kpi.noCacheCost > 0 && kpi.totalCost != null ? ` · 缓存省钱 ${fmtUsd(kpi.noCacheCost - kpi.totalCost)}（无缓存等值 ${fmtUsd(kpi.noCacheCost)}，省 ${Math.round(100 * (1 - kpi.totalCost / kpi.noCacheCost))}%）` : ''))
+  lines.push(`- 工具执行 ${fmtInt(kpi.toolCalls)} 次 · 模型耗时 ${fmtDur(kpi.modelMs)} · 活动跨度 ${fmtDur(kpi.spanMs)}（非模型时间约 ${fmtDur(Math.max(0, kpi.spanMs - kpi.modelMs))}）`)
+  lines.push(`- 上下文压缩 ${fmtInt(kpi.compEvents)} 次（涉及 ${kpi.compSessions} 个会话）`)
+  if (kpi.auxN) lines.push(`- 辅助请求 ${fmtInt(kpi.auxN)} 次 · ${fmtTok(kpi.auxTok)} tok（后台搜索/标题生成/compact 等隐形流量，未计入健康度评分）`)
+  lines.push('')
+
+  lines.push('### 模型分布')
+  lines.push('| 模型 | provider | 请求 | 输入 | 输出 | 缓存命中 | 成本折算 |')
+  lines.push('|---|---|---|---|---|---|---|')
+  for (const [m, d] of a.models) lines.push(`| ${m ?? 'N/A'} | ${d.provider ?? '-'}${isPlanProvider(d.provider) ? '（套餐）' : ''} | ${d.n} | ${fmtTok(d.in)} | ${fmtTok(d.out)} | ${fmtTok(d.cr)} | ${fmtUsd(d.cost)} |`)
+
+  lines.push('')
+  lines.push('### 工作区分布（前 8，按 token）')
+  lines.push('| 工作区 | 会话 | 请求 | token | 成本折算 |')
+  lines.push('|---|---|---|---|---|')
+  for (const [ws, d] of a.wsTop) lines.push(`| ${wsDisplay(ws)} | ${d.sessions} | ${d.reqs} | ${fmtTok(d.tok)} | ${fmtUsd(d.cost)} |`)
+
+  if (!brief && a.days7.length) {
+    lines.push('')
+    lines.push('### 每日用量（近 7 个活跃日）')
+    lines.push('```')
+    const maxTok = Math.max(...a.days7.map(([, d]) => d.tok), 1)
+    for (const [day, d] of a.days7) {
+      const bar = '█'.repeat(Math.max(1, Math.round(30 * d.tok / maxTok)))
+      lines.push(`${day} ${bar} ${fmtTok(d.tok)} tok ${fmtUsd(d.cost)}`)
+    }
+    lines.push('```')
+  }
+
+  // 8 周活动热力图（真实日历排布，按窗口内最大日 token 归一；无数据日显示 ·）
+  if (!brief && a.daily.size > 7) {
+    const maxDayTok = Math.max(...[...a.daily.values()].map(d => d.tok), 1)
+    const blocks = '▁▂▃▄▅▆▇█'
+    const cell = d => d == null ? '·' : blocks[Math.min(7, Math.floor(8 * d.tok / maxDayTok))]
+    // 从最后一个有数据的日子（本地日期）往前取 55 天，补齐日历
+    const lastDay = [...a.daily.keys()].sort().pop()
+    const cells = []
+    const cursor = new Date(lastDay + 'T00:00:00')
+    cursor.setDate(cursor.getDate() - 55)
+    for (let i = 0; i < 56; i++) {
+      const key = localDayKey(cursor)
+      cells.push(cell(a.daily.get(key)?.tok))
+      cursor.setDate(cursor.getDate() + 1)
+    }
+    lines.push('')
+    lines.push('### 活动热力图（近 8 周 · 每行一周，▁→█ 递增，· 无数据）')
+    lines.push('```')
+    for (let w = 0; w < 56; w += 7) lines.push(cells.slice(w, w + 7).join(''))
+    lines.push('```')
+  }
+
+  if (!brief && a.hourly.some(v => v > 0)) {
+    const maxH = Math.max(...a.hourly, 1)
+    lines.push('')
+    lines.push('### 小时分布（本机时区，按 token）')
+    lines.push('```')
+    for (let h = 0; h < 24; h += 12) {
+      const seg = a.hourly.slice(h, h + 12)
+      lines.push(`${String(h).padStart(2, '0')}-${String(h + 11).padStart(2, '0')}时 ` + seg.map(v => {
+        const blocks = '▁▂▃▄▅▆▇█'
+        return v === 0 ? '·' : blocks[Math.min(7, Math.floor(8 * v / maxH))]
+      }).join(''))
+    }
+    const peakHour = a.hourly.indexOf(Math.max(...a.hourly))
+    lines.push(`峰值时段 ${String(peakHour).padStart(2, '0')}:00（${fmtTok(a.hourly[peakHour])} tok）`)
+    lines.push('```')
+  }
+
+  lines.push('')
+  lines.push('### 会话榜（按 token，前 10）')
+  lines.push('| 会话 | 工作区 | 请求 | token | 成本 | 最近活跃 |')
+  lines.push('|---|---|---|---|---|---|')
+  for (const t of a.top) lines.push(`| ${shortSid(t.sid)}${isSub(t.sid) ? '（子）' : ''} | ${wsDisplay(t.workspace)} | ${t.n} | ${fmtTok(t.tok)} | ${fmtUsd(t.cost)} | ${fmtDate(t.last)} |`)
+
   const ledger = (title, entries, fmt) => {
     if (!entries.length) return
     lines.push('')
@@ -1283,16 +1302,108 @@ async function toolInsights(args = {}, idx) {
     lines.push('```')
   }
   if (!brief) {
-    ledger('工具调用账本（前 15）', [...toolLedger.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15),
+    ledger('工具调用账本（前 15）', [...a.toolLedger.entries()].sort((x, y) => y[1] - x[1]).slice(0, 15),
       ([name, n]) => `${name.padEnd(28)} ${fmtInt(n)}`)
-    ledger('技能加载（前 10）', [...skillLedger.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 10),
+    ledger('技能加载（前 10）', [...a.skillLedger.entries()].sort((x, y) => y[1].n - x[1].n).slice(0, 10),
       ([k, d]) => `${k.padEnd(28)} ${fmtInt(d.n)} 次 · 最近 ${fmtDate(d.last)}`)
-    ledger('文件活动（前 12，读/写/其他）', [...fileLedger.entries()].map(([f, d]) => [f, d, d.reads + d.writes + d.other]).sort((a, b) => b[2] - a[2]).slice(0, 12),
+    ledger('文件活动（前 12，读/写/其他）', [...a.fileLedger.entries()].map(([f, d]) => [f, d, d.reads + d.writes + d.other]).sort((x, y) => y[2] - x[2]).slice(0, 12),
       ([f, d]) => `${homePath(f).slice(-64).padStart(64)} 读${d.reads} 写${d.writes}${d.other ? ` 他${d.other}` : ''}`)
-    ledger('命令执行（按程序，前 12）', [...cmdLedger.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 12),
+    ledger('命令执行（按程序，前 12）', [...a.cmdLedger.entries()].sort((x, y) => y[1].n - x[1].n).slice(0, 12),
       ([p, d]) => `${p.padEnd(20)} ${fmtInt(d.n)} 次 · 例：${d.example}`)
   }
   return lines.join('\n')
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+
+/**
+ * HTML 报表（对标 ccusage 的可视化，单文件零依赖）：复用 collectInsights 聚合层，
+ * 写 exports/，含 KPI/模型/工作区/每日柱状/小时分布/热力图/会话榜/健康度排名。
+ */
+async function toolReport(args = {}, idx) {
+  const a = collectInsights(args, idx)
+  if (a.empty) return `时间范围 ${a.range}${a.wsFilter ? ` · 工作区 ${a.wsFilter}` : ''}${a.q ? ` · 搜索 "${args.query}"` : ''} 内没有请求记录。`
+  const { kpi } = a
+  const hitRate = kpi.inTok ? (100 * kpi.cr / kpi.inTok).toFixed(1) + '%' : 'N/A'
+  const savePct = kpi.noCacheCost > 0 && kpi.totalCost != null ? Math.round(100 * (1 - kpi.totalCost / kpi.noCacheCost)) : 0
+  const table = (head, rows) => `<table><thead><tr>${head.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+  const bar = (v, max) => `<div class="bar" style="width:${Math.max(2, Math.round(100 * v / Math.max(max, 1)))}%"></div>`
+  // 每日柱状（全部活跃日，CSS 高度柱）
+  const dayRows = [...a.daily.entries()].sort((x, y) => x[0].localeCompare(y[0]))
+  const maxDay = Math.max(...dayRows.map(([, d]) => d.tok), 1)
+  const dailyHtml = dayRows.map(([day, d]) =>
+    `<div class="col" title="${day} · ${esc(fmtTok(d.tok))} tok · ${esc(fmtUsd(d.cost))}"><div class="colbar" style="height:${Math.max(2, Math.round(120 * d.tok / maxDay))}px"></div><span>${day.slice(5)}</span></div>`).join('')
+  // 热力图 8 周
+  let heatHtml = ''
+  if (a.daily.size > 7) {
+    const maxDayTok = Math.max(...[...a.daily.values()].map(d => d.tok), 1)
+    const lv = t => t == null ? 0 : Math.min(4, 1 + Math.floor(4 * t / maxDayTok))
+    const lastDay = [...a.daily.keys()].sort().pop()
+    const cursor = new Date(lastDay + 'T00:00:00')
+    cursor.setDate(cursor.getDate() - 55)
+    const cells = []
+    for (let i = 0; i < 56; i++) {
+      const key = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}-${String(cursor.getDate()).padStart(2, '0')}`
+      const t = a.daily.get(key)?.tok
+      cells.push(`<i class="h${lv(t)}" title="${key} · ${t ? esc(fmtTok(t)) : '无数据'}"></i>`)
+      cursor.setDate(cursor.getDate() + 1)
+    }
+    heatHtml = `<h2>活动热力图（近 8 周）</h2><div class="heat">${cells.join('')}</div>`
+  }
+  // 健康度排名（复用评分，最差 10）
+  const healthRows = []
+  for (const [sid, e] of Object.entries(idx.sessions)) {
+    if (a.wsFilter && !(e.workspace || '').startsWith(a.wsFilter)) continue
+    const reqs = sortedReqs(e).filter(r => r.ts && Date.parse(r.ts) >= (RANGES[a.range] === Infinity ? 0 : Date.now() - RANGES[a.range] * 86400_000))
+    if (reqs.length < 3) continue
+    const sc = scoreSession(reqs, reqs[reqs.length - 1].model, sid)
+    if (sc.total != null) healthRows.push({ sid, total: sc.total, parts: sc.parts, tok: sc.metrics.inTok + sc.metrics.outTok })
+  }
+  healthRows.sort((x, y) => x.total - y.total)
+  const html = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Context Insights 报表 · ${esc(a.range)}</title>
+<style>
+body{font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#0f1117;color:#d8d9dd}
+main{max-width:1080px;margin:0 auto;padding:24px}
+h1{font-size:22px}h2{font-size:16px;margin:28px 0 10px;border-left:3px solid #5b8def;padding-left:10px}
+.kpi{display:flex;flex-wrap:wrap;gap:12px}.kpi div{background:#181b25;border-radius:8px;padding:12px 18px;min-width:150px}
+.kpi b{display:block;font-size:20px;color:#fff}.kpi span{color:#8a8f98;font-size:12px}
+table{border-collapse:collapse;width:100%;margin:8px 0}th,td{padding:6px 10px;border-bottom:1px solid #262a35;text-align:left}
+th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabular-nums}
+.chart{display:flex;align-items:flex-end;gap:4px;height:150px}.col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;flex:1}
+.colbar{background:#5b8def;border-radius:3px 3px 0 0;width:100%}.col span{font-size:10px;color:#8a8f98;margin-top:4px}
+.heat{display:grid;grid-template-columns:repeat(28,12px);gap:3px}.heat i{width:12px;height:12px;border-radius:2px;background:#1d2029;display:inline-block}
+.h1{background:#1d3a6b}.h2{background:#2c5bbd}.h3{background:#5b8def}.h4{background:#9db9f5}
+.bar{height:10px;background:#5b8def;border-radius:2px}
+footer{color:#8a8f98;font-size:12px;margin-top:32px}
+</style><main>
+<h1>Context Insights 用量报表</h1>
+<div class="kpi">
+<div><b>${fmtInt(kpi.nSessions)}</b><span>会话（子 agent ${kpi.nSub}）</span></div>
+<div><b>${fmtInt(kpi.nReqs)}</b><span>请求</span></div>
+<div><b>${fmtTok(kpi.inTok + kpi.outTok)}</b><span>token（输入 ${fmtTok(kpi.inTok)}）</span></div>
+<div><b>${fmtUsd(kpi.totalCost)}</b><span>成本折算${kpi.noCacheCost > 0 ? ` · 缓存省 ${savePct}%` : ''}</span></div>
+<div><b>${hitRate}</b><span>缓存命中率</span></div>
+<div><b>${fmtInt(kpi.compEvents)}</b><span>上下文压缩</span></div>
+${kpi.auxN ? `<div><b>${fmtTok(kpi.auxTok)}</b><span>辅助流量（${kpi.auxN} 次）</span></div>` : ''}
+</div>
+<h2>模型分布</h2>${table(['模型', 'provider', '请求', '输入', '输出', '缓存命中', '成本'], a.models.map(([m, d]) => [esc(m ?? 'N/A'), esc((d.provider ?? '-') + (isPlanProvider(d.provider) ? '（套餐）' : '')), `<span class="num">${d.n}</span>`, `<span class="num">${fmtTok(d.in)}</span>`, `<span class="num">${fmtTok(d.out)}</span>`, `<span class="num">${fmtTok(d.cr)}</span>`, `<span class="num">${fmtUsd(d.cost)}</span>`]))}
+<h2>工作区分布（前 8）</h2>${table(['工作区', '会话', '请求', 'token', '成本'], a.wsTop.map(([ws, d]) => [esc(wsDisplay(ws)), d.sessions, d.reqs, `<span class="num">${fmtTok(d.tok)}</span>`, `<span class="num">${fmtUsd(d.cost)}</span>`]))}
+<h2>每日用量（token）</h2><div class="chart">${dailyHtml}</div>
+${heatHtml}
+${a.hourly.some(v => v > 0) ? `<h2>小时分布（本机时区）</h2><div class="chart">${a.hourly.map((v, h) => `<div class="col" title="${h}:00 · ${esc(fmtTok(v))}"><div class="colbar" style="height:${Math.max(2, Math.round(120 * v / Math.max(...a.hourly, 1)))}px;background:#3ecf8e"></div><span>${h}</span></div>`).join('')}</div>` : ''}
+<h2>会话榜（按 token，前 10）</h2>${table(['会话', '工作区', '请求', 'token', '成本', '最近活跃'], a.top.map(t => [esc(shortSid(t.sid)) + (isSub(t.sid) ? '（子）' : ''), esc(wsDisplay(t.workspace)), t.n, `<span class="num">${fmtTok(t.tok)}</span>`, `<span class="num">${fmtUsd(t.cost)}</span>`, esc(fmtDate(t.last))]))}
+${healthRows.length ? `<h2>健康度最差前 10（优先治理）</h2>${table(['会话', '总分', '评级', '缓存', '窗口', '压缩', '成本效率', 'token'], healthRows.slice(0, 10).map(r => [esc(shortSid(r.sid)) + (isSub(r.sid) ? '（子）' : ''), r.total, esc(gradeOf(r.total)), r.parts.cache?.score ?? '-', r.parts.window?.score ?? '-', r.parts.compaction?.score ?? '-', r.parts.efficiency?.score ?? '-', `<span class="num">${fmtTok(r.tok)}</span>`]))}` : ''}
+<footer>Context Insights v1.3.0 · 生成于 ${esc(fmtDate(new Date().toISOString()))} · 范围 ${esc(a.range)}${a.wsFilter ? ` · 工作区 ${esc(wsDisplay(a.wsFilter))}` : ''}${a.q ? ` · "${esc(args.query)}"` : ''} · 成本为按量牌价折算的等值成本 · 数据仅存本机</footer>
+</main></html>`
+  const dir = join(configDir(), 'exports')
+  mkdirSync(dir, { recursive: true })
+  const now = new Date()
+  const stamp = `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}-${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`
+  const file = join(dir, `context-insights-report-${stamp}.html`)
+  writeFileSync(file, html)
+  let size = 0
+  try { size = statSync(file).size } catch { /* 统计失败不影响结果 */ }
+  return [`## HTML 报表已生成`, '', `- 文件：\`${file}\``, `- 大小 ${fmtTok(size / 1e6)}MB · 范围 ${a.range}${a.wsFilter ? ` · 工作区 ${wsDisplay(a.wsFilter)}` : ''}`, '', '> 用浏览器打开即可（深色单文件，无外部资源）。含 KPI/模型/工作区/每日/热力图/小时分布/会话榜/健康度排名。', ''].join('\n')
 }
 
 async function toolSessionList(args = {}, idx) {
@@ -1475,6 +1586,18 @@ const TOOLS = [
     },
   },
   {
+    name: 'context_report',
+    description: '生成单文件 HTML 用量报表（深色、零外部资源）到 ~/.zcode/context-insights/exports/：KPI 卡片、模型/工作区分布、每日柱状、8 周热力图、小时分布、会话榜、健康度最差排名。浏览器打开即看；支持 range/workspace/query 过滤。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        range: { type: 'string', enum: ['today', '7d', '30d', 'all'], description: '统计时间范围，默认 7d' },
+        workspace: { type: 'string', description: '工作区路径前缀过滤' },
+        query: { type: 'string', description: '会话标题/工作区/id 子串过滤' },
+      },
+    },
+  },
+  {
     name: 'pricing_info',
     description: '当前生效的价格表（内置 + 自动层 + 用户覆盖合并后）、计费口径说明与覆盖方法。',
     inputSchema: { type: 'object', properties: {} },
@@ -1524,6 +1647,7 @@ async function dispatch(name, args) {
     case 'session_list': return toolSessionList(args, await ensureIndex())
     case 'context_search': return toolSearch(args, await ensureIndex())
     case 'context_export': return toolExport(args, await ensureIndex())
+    case 'context_report': return toolReport(args, await ensureIndex())
     case 'context_health': return toolHealth(args, await ensureIndex())
     case 'session_digest': return toolDigest(args, await ensureIndex())
     case 'context_compare': return toolCompare(args, await ensureIndex())
@@ -1547,7 +1671,7 @@ rl.on('line', async line => {
       jsonrpc: '2.0', id, result: {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'context-insights', version: '1.2.0' },
+        serverInfo: { name: 'context-insights', version: '1.3.0' },
       },
     })
   } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {

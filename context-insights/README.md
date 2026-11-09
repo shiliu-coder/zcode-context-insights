@@ -85,4 +85,4 @@ rollout 历史可达数十 GB。首次调用 `context_trend`/`context_insights`/
 | 0.8.0 | 评估与回顾：`context_health` 四维健康度评分（单会话诊断 + 最差排名）、`session_digest` 会话速览（"这个会话干了啥"）、`context_search` 正则模式（搜索基础设施谓词化） |
 | 0.9.1 | 运行日志与代码审计修复：索引每 60s 自动增量刷新（修复长会话数据陈旧）、并发落盘合并（session 隔离下多 server 写同一索引）、耗时显示 fmtDur（消除 "Ms" 歧义）、父归属按启动时间序、CSV 公式注入防护、实况描述截断 |
 | 1.0.0 | 里程碑：`context_compare` 会话对比、`session_digest` 批量速览（recent:N）、`/weekly` 周报命令；真机 dogfood 验证（60s 刷新在生产会话生效）。14 工具 + 4 命令，功能面收敛 |
-| 1.1.0 | 工程加固：零依赖测试套件（`node --test mcp/test/`，16 例：成本口径/组成加权/索引增量/协议握手）；`pricing_refresh` 在线刷新价格表（opt-in 网络请求，写入自动层不覆盖手写配置）。15 工具 + 4 命令 |
+| 1.2.0 | 流量三分与搜索修复：索引 v3 记录 querySource，请求三分（主对话/子 agent/辅助），**健康度评分剔除辅助流**（修复背景小请求拉爆缓存分的评分冤案）；insights 辅助流量 KPI；`context_search` `includeTools`（工具调用输入，稳定分区优先）+ **候选按文件大小升序**（修复巨文件烧光预算饿死小文件）；索引向下兼容（版本升级不再触发全量重建风暴）+ 无 qs 小文件一次性补扫 |
