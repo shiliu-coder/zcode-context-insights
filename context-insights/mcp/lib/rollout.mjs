@@ -8,7 +8,7 @@ import { createReadStream, existsSync, openSync, closeSync, fstatSync, statSync,
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const INDEX_VERSION = 2
+const INDEX_VERSION = 3
 
 export function rolloutDir() {
   return process.env.CONTEXT_INSIGHTS_ROLLOUT_DIR || join(homedir(), '.zcode', 'cli', 'rollout')
@@ -45,10 +45,17 @@ export function resolveSession(sessionHint) {
 function loadIndex() {
   try {
     const idx = JSON.parse(readFileSync(indexFile(), 'utf8'))
-    if (idx && idx.version === INDEX_VERSION && idx.sessions && typeof idx.sessions === 'object') return idx
+    // 向下兼容：接受旧版本索引（缺的新字段靠增量/一次性补扫渐进补全）。
+    // 严格拒绝会引发"全量重建风暴"——多版本 server 并存时（session 隔离）互相摧毁索引。
+    if (idx && typeof idx.version === 'number' && idx.version <= INDEX_VERSION && idx.sessions && typeof idx.sessions === 'object') {
+      return { idx, stale: idx.version < INDEX_VERSION }
+    }
   } catch { /* 无索引或损坏：按不存在处理，重建 */ }
-  return { version: INDEX_VERSION, sessions: {} }
+  return { idx: { version: INDEX_VERSION, sessions: {} }, stale: false }
 }
+
+// 进程级一次性补扫标记：索引版本落后时对缺 qs 的旧条目强制重扫一次（此后接受渐进补全）
+let qsRescanDone = false
 
 function saveIndexAtomic(idx) {
   const file = indexFile()
@@ -61,6 +68,10 @@ function saveIndexAtomic(idx) {
       for (const [sid, d] of Object.entries(disk.sessions)) {
         const mine = idx.sessions[sid]
         if (!mine) { idx.sessions[sid] = d; continue }
+        // 保护新字段：内存条目已补 qs（新版本扫描）时，不被磁盘上旧版本的无 qs 条目降级覆盖
+        const mineHasQs = (mine.requests || []).some(r => r.qs)
+        const diskHasQs = (d.requests || []).some(r => r.qs)
+        if (mineHasQs && !diskHasQs) continue
         const diskNewer = (d.size || 0) > (mine.size || 0)
           || (d.size === mine.size && (d.mtimeMs || 0) > (mine.mtimeMs || 0))
         if (diskNewer) idx.sessions[sid] = d
@@ -99,6 +110,8 @@ function summarize(record, lineOffset) {
     ts: record.completedAt || record.startedAt || null,
     model: m.modelId || null,
     provider: m.providerId || null,
+    // querySource：main_turn / subagent / web_search_tool / compact / *_title 等辅助流（v3 起记录，供流量三分）
+    qs: record.querySource || null,
     in: u.inputTokens ?? null,
     out: u.outputTokens ?? null,
     cr: u.cacheReadTokens ?? null,
@@ -145,14 +158,19 @@ function extractMeta(record) {
  * 每处理完一个文件就原子落盘一次，中断可续。大历史首次构建可能耗时数分钟。
  */
 export async function updateIndex(onProgress) {
-  const idx = loadIndex()
+  const { idx } = loadIndex()
+  const rescanMissingQs = !qsRescanDone
   const sessions = listSessions()
   let parsed = 0, appended = 0
   for (const s of sessions) {
     const entry = idx.sessions[s.sid]
     let offset = 0, requests = entry?.requests || [], meta = entry ? { workspace: entry.workspace, title: entry.title } : null
-    if (entry && entry.file === s.file && s.size >= entry.offset && s.size === entry.size && s.mtimeMs === entry.mtimeMs) continue
-    if (entry && entry.file === s.file && s.size >= entry.offset) offset = entry.offset
+    // 进程首刷：缺 qs 的**小**文件（≤800MB，辅助流文件都很小）强制重扫一次补字段；
+    // 巨型主会话文件跳过（aux 占比低，靠新行渐进），避免每次冷启动都全量重扫 20GB
+    const needsQsRescan = rescanMissingQs && requests.length > 0 && !requests.some(r => r.qs)
+      && (entry?.size || s.size) <= 800 * 1024 * 1024
+    if (!needsQsRescan && entry && entry.file === s.file && s.size >= entry.offset && s.size === entry.size && s.mtimeMs === entry.mtimeMs) continue
+    if (!needsQsRescan && entry && entry.file === s.file && s.size >= entry.offset) offset = entry.offset
     else requests = []
     // base 追踪已消费的完整行边界（字节语义，外层可见，落盘时用）
     let base = offset
@@ -187,6 +205,7 @@ export async function updateIndex(onProgress) {
     saveIndexAtomic(idx)
     if (onProgress) onProgress(s.sid, parsed, appended)
   }
+  qsRescanDone = true
   // 清理已删除的会话文件条目。
   const live = new Set(sessions.map(s => s.sid))
   let removed = false

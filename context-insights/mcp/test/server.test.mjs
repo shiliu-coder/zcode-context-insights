@@ -14,12 +14,13 @@ const here = dirname(fileURLToPath(import.meta.url))
 const serverPath = join(here, '..', 'server.mjs')
 
 writeFileSync(join(rolloutDir, 'model-io-sess_live1.jsonl'), JSON.stringify({
-  type: 'model_io', completedAt: '2026-11-09T09:00:00Z', durationMs: 50,
+  type: 'model_io', completedAt: '2026-11-09T09:00:00Z', durationMs: 50, querySource: 'main_turn',
   model: { modelId: 'glm-5.3', providerId: 'zhipuai' },
   request: { body: { model: 'glm-5.3', system: '', tools: [], messages: [
     { role: 'user', content: [{ type: 'text', text: 'Primary working directory: /tmp/live' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'x1', name: 'Bash', input: { command: 'cargo test -p epoch-core' } }] },
   ] } },
-  response: { usage: { inputTokens: 300, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 }, toolCalls: [] },
+  response: { usage: { inputTokens: 300, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 }, toolCalls: [{ id: 'x1', name: 'Bash', input: { command: 'cargo test -p epoch-core' } }] },
 }) + '\n')
 
 function rpc(msgs, timeoutMs = 60000) {
@@ -46,24 +47,28 @@ function rpc(msgs, timeoutMs = 60000) {
   })
 }
 
-test('MCP 握手 + 工具清单（14 个）+ 真实数据调用 + 未知方法报错', async () => {
+test('MCP 握手 + 工具清单 + 真实数据调用 + 搜索 includeTools + 未知方法报错', async () => {
   const out = await rpc([
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } },
     { jsonrpc: '2.0', method: 'notifications/initialized' },
     { jsonrpc: '2.0', id: 2, method: 'tools/list' },
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'context_composition', arguments: {} } },
     { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'context_trend', arguments: {} } },
-    { jsonrpc: '2.0', id: 5, method: 'bogus/method', params: {} },
+    { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'context_search', arguments: { query: 'cargo test', includeTools: true, range: 'all', limit: 3 } } },
+    { jsonrpc: '2.0', id: 6, method: 'bogus/method', params: {} },
   ])
   const byId = Object.fromEntries(out.map(m => [m.id, m]))
   assert.equal(byId[1].result.serverInfo.name, 'context-insights')
-  assert.ok(byId[2].result.tools.length >= 14, `工具数 ${byId[2].result.tools.length}`)
+  assert.ok(byId[2].result.tools.length >= 15, `工具数 ${byId[2].result.tools.length}`)
   const comp = byId[3].result.content[0].text
   assert.ok(comp.includes('上下文组成'), comp.slice(0, 200))
   assert.ok(comp.includes('live1'), '应命中合成会话 live1')
   const trend = byId[4].result.content[0].text
   assert.ok(trend.includes('上下文趋势'))
-  assert.equal(byId[5].error.code, -32601)
+  const search = byId[5].result.content[0].text
+  assert.ok(search.includes('工具调用') && search.includes('Bash'), `includeTools 应命中工具调用输入：\n${search.slice(0, 400)}`)
+  assert.ok(search.includes('request=-'))
+  assert.equal(byId[6].error.code, -32601)
 }, { timeout: 90000 })
 
 test.after?.(() => { rmSync(root, { recursive: true, force: true }) })

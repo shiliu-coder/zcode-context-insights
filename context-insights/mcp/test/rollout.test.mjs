@@ -17,7 +17,7 @@ const { updateIndex, tailLastLine, readLineAt, searchSessionFile, listSessions, 
 
 const file = join(rolloutDir, 'model-io-sess_test1.jsonl')
 const rec = (ts, marker) => JSON.stringify({
-  type: 'model_io', completedAt: ts, durationMs: 100,
+  type: 'model_io', completedAt: ts, durationMs: 100, querySource: 'main_turn',
   model: { modelId: 'glm-5.3', providerId: 'zhipuai' },
   request: { body: { model: 'glm-5.3', system: '', tools: [], messages: [
     { role: 'user', content: [{ type: 'text', text: `Primary working directory: /tmp/proj\n${marker ?? ''}` }] },
@@ -39,12 +39,13 @@ test('updateIndex：首次全量，工作区/标题从首条消息提取', async
   assert.equal(e.workspace, '/tmp/proj')
 })
 
-test('updateIndex：追加一行后增量续读，偏移单调且命中新行', async () => {
+test('updateIndex：追加一行后增量续读，偏移单调且命中新行；qs 字段入索引', async () => {
   appendFileSync(file, rec('2026-11-09T03:00:00Z', 'third') + '\n')
   const idx = await updateIndex()
   const reqs = idx.sessions.sess_test1.requests
   assert.equal(reqs.length, 3)
   assert.ok(reqs[2].off > reqs[1].off)
+  assert.equal(reqs[0].qs, 'main_turn')
   const rec2 = readLineAt(file, reqs[1].off)
   assert.equal(rec2.completedAt, '2026-11-09T02:00:00Z')
 })

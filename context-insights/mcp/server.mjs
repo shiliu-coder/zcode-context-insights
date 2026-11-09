@@ -80,6 +80,19 @@ function requestCostUsd(r) {
 /** 按时间排序的请求序列。 */
 const sortedReqs = entry => (entry?.requests || []).slice().sort((a, b) => (a.ts || '').localeCompare(b.ts || ''))
 
+/**
+ * 请求流量三分（v1.2，基于 querySource）：
+ * - sub：子 agent 会话的请求（文件名即证）
+ * - aux：隐形辅助流（web_search_tool 后台检索、标题/摘要生成、compact、验证等）——不缓存、低价值高频，
+ *   计入总量但**不参与健康度评分**（否则背景小请求会把缓存分拉爆）
+ * - main：主对话请求（main_turn 或旧记录无字段者）
+ */
+function reqClass(r, sid) {
+  if (isSub(sid)) return 'sub'
+  const qs = r.qs || 'main_turn'
+  return qs === 'main_turn' ? 'main' : 'aux'
+}
+
 function rolloutDirOf() { return process.env.CONTEXT_INSIGHTS_ROLLOUT_DIR || '~/.zcode/cli/rollout' }
 
 /**
@@ -440,8 +453,8 @@ async function toolPricingInfo() {
   return lines.join('\n')
 }
 
-/** 从一条请求记录抽出可搜索文本（用户消息/助手回复/工具结果）；上限 400 段防失控。 */
-function extractSearchTexts(record) {
+/** 从一条请求记录抽出可搜索文本（用户消息/助手回复/工具结果；includeTools 时含工具调用输入）；上限 400 段防失控。 */
+function extractSearchTexts(record, includeTools = false) {
   const out = []
   const msgs = record?.request?.body?.messages
   if (Array.isArray(msgs)) {
@@ -457,12 +470,16 @@ function extractSearchTexts(record) {
           const cc = b?.content
           const items2 = typeof cc === 'string' ? [{ type: 'text', text: cc }] : (Array.isArray(cc) ? cc : [])
           for (const b2 of items2) if (b2?.type === 'text' && typeof b2.text === 'string') out.push({ kind: '工具结果', text: b2.text })
+        } else if (includeTools && b?.type === 'tool_use') {
+          out.push({ kind: '工具调用', text: `${b.name} ${JSON.stringify(b.input ?? {})}` })
         }
       }
       if (out.length > 400) break
     }
   }
   if (typeof record?.response?.text === 'string' && record.response.text) out.push({ kind: 'assistant', text: record.response.text })
+  // includeTools 时工具调用输入排前（稳定分区）——否则大段助手回放文本总先命中，工具调用永无露面机会
+  if (includeTools) out.sort((a, b) => (a.kind === '工具调用' ? 0 : 1) - (b.kind === '工具调用' ? 0 : 1))
   return out
 }
 
@@ -490,10 +507,14 @@ async function toolSearch(args = {}, idx) {
   const wsFilter = typeof args.workspace === 'string' && args.workspace ? args.workspace.replace(/\/+$/, '') : null
   const limit = Math.min(Math.max(parseInt(args.limit) || 20, 1), 50)
   const perSession = 5
+  const sizeBySid = new Map(listSessions().map(s => [s.sid, s.size]))
   const candidates = Object.entries(idx.sessions)
     .map(([sid, e]) => ({ sid, e, reqs: (e.requests || []).filter(r => r.ts && Date.parse(r.ts) >= cutoff) }))
     .filter(c => c.reqs.length && (!wsFilter || (c.e.workspace || '').startsWith(wsFilter)))
-    .sort((a, b) => (b.reqs[b.reqs.length - 1].ts || '').localeCompare(a.reqs[a.reqs.length - 1].ts || ''))
+    // 小文件优先：保证扫描广度（aux/子 agent 文件都很小），巨型主会话文件最后兜底——
+    // 否则 2GB 级文件按活跃序排前会烧光全局字节预算，饿死其余候选
+    .sort((a, b) => (sizeBySid.get(a.sid) || 0) - (sizeBySid.get(b.sid) || 0)
+      || (b.reqs[b.reqs.length - 1].ts || '').localeCompare(a.reqs[a.reqs.length - 1].ts || ''))
   if (!candidates.length) return `时间范围 ${range} 内没有可搜索的会话。`
   const maxBytesTotal = parseInt(process.env.CONTEXT_INSIGHTS_SEARCH_MAX_BYTES) || 4 * 1024 ** 3
   const lines = [`## 会话内容搜索 · ${useRegex ? `正则` : `"`}${query}${useRegex ? `` : `"`}（${useRegex ? '正则模式 · ' : ''}${range}${wsFilter ? ` · 工作区 ${wsDisplay(wsFilter)}` : ''}）`, '']
@@ -511,7 +532,7 @@ async function toolSearch(args = {}, idx) {
     let per = 0
     for (const h of hits) {
       if (total >= limit || per >= perSession) break
-      for (const t of extractSearchTexts(h.record)) {
+      for (const t of extractSearchTexts(h.record, args.includeTools === true)) {
         const found = findAt(t.text)
         if (!found) continue
         const { at, len } = found
@@ -756,7 +777,10 @@ const HEALTH_ADVICE = {
  * 单会话健康度评分（启发式）：缓存效率 35% / 窗口纪律 25% / 压缩频率 20% / 成本效率 20%。
  * 数据不足的维度记 N/A 并按剩余权重重分配；压缩判定与 context_events 同口径。
  */
-function scoreSession(reqs, modelId) {
+function scoreSession(allReqs, modelId, sid) {
+  const aux = allReqs.filter(r => reqClass(r, sid) === 'aux')
+  // 参与评分的请求剔除辅助流；metrics 仍保留全量口径
+  const reqs = aux.length ? allReqs.filter(r => reqClass(r, sid) !== 'aux') : allReqs
   const n = reqs.length
   const inTok = sum(reqs, r => r.in), cr = sum(reqs, r => r.cr), outTok = sum(reqs, r => r.out)
   const peak = Math.max(0, ...reqs.map(r => r.in || 0))
@@ -786,7 +810,7 @@ function scoreSession(reqs, modelId) {
   }
   const wsum = Object.values(parts).reduce((s, p) => s + p.weight, 0)
   const total = wsum ? Math.round(Object.values(parts).reduce((s, p) => s + p.score * p.weight, 0) / wsum) : null
-  return { total, parts, metrics: { n, inTok, outTok, cr, peak, comp, billed, limit } }
+  return { total, parts, metrics: { n, inTok, outTok, cr, peak, comp, billed, limit, auxN: aux.length, auxTok: sum(aux, r => (r.in || 0) + (r.out || 0)) } }
 }
 
 /** 会话健康度：单会话诊断（默认最近活跃）或范围内排名（最差优先，actionable）。 */
@@ -802,7 +826,7 @@ async function toolHealth(args = {}, idx) {
     const reqs = reqsInRange(idx.sessions[target.sid])
     if (!reqs.length) return `${target.sid} 在 ${range} 内没有请求记录。`
     const lastModel = reqs[reqs.length - 1].model
-    const sc = scoreSession(reqs, lastModel)
+    const sc = scoreSession(reqs, lastModel, target.sid)
     const lines = []
     lines.push(`## 会话健康度 · ${shortSid(target.sid)}（${range}）`)
     if (entryTitleOf(idx.sessions[target.sid])) lines.push(`> ${entryTitleOf(idx.sessions[target.sid]).slice(0, 80)}`)
@@ -812,6 +836,7 @@ async function toolHealth(args = {}, idx) {
       return lines.join('\n')
     }
     lines.push(`**总分 ${sc.total}/100 · 评级 ${gradeOf(sc.total)}**`)
+    if (sc.metrics.auxN) lines.push(`（已剔除 ${sc.metrics.auxN} 条辅助请求（${fmtTok(sc.metrics.auxTok)} tok）——后台搜索/标题/compact 等不缓存小流量，不参与评分）`)
     lines.push('')
     lines.push('| 维度 | 得分 | 权重 | 依据 |')
     lines.push('|---|---|---|---|')
@@ -836,7 +861,7 @@ async function toolHealth(args = {}, idx) {
     if (wsFilter && !(e.workspace || '').startsWith(wsFilter)) continue
     const reqs = reqsInRange(e)
     if (reqs.length < 3) continue
-    const sc = scoreSession(reqs, reqs[reqs.length - 1].model)
+    const sc = scoreSession(reqs, reqs[reqs.length - 1].model, sid)
     if (sc.total == null) continue
     rows.push({ sid, ws: e.workspace, total: sc.total, parts: sc.parts, tok: sc.metrics.inTok + sc.metrics.outTok })
   }
@@ -891,7 +916,7 @@ async function toolDigest(args = {}, idx) {
   const reqs = sortedReqs(entry)
   if (!reqs.length) return `${target.sid} 在索引中没有请求记录。`
   const lastModel = reqs[reqs.length - 1].model
-  const sc = scoreSession(reqs, lastModel)
+  const sc = scoreSession(reqs, lastModel, target.sid)
   // 会话内账本（ops 摘要）
   const toolL = new Map(), fileL = new Map(), cmdL = new Map()
   const READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'NotebookRead', 'mcp__web_reader__webReader'])
@@ -963,7 +988,7 @@ async function digestRecent(n, idx) {
   if (!rows.length) return '没有可速览的会话。'
   const lines = [`## 最近会话速览（前 ${rows.length}，按最近活跃）`, '']
   for (const r of rows) {
-    const sc = scoreSession(r.reqs, r.reqs[r.reqs.length - 1].model)
+    const sc = scoreSession(r.reqs, r.reqs[r.reqs.length - 1].model, r.info.sid)
     const dur = (Date.parse(r.reqs[r.reqs.length - 1].ts) - Date.parse(r.reqs[0].ts)) || null
     const turns = new Set(r.reqs.map(x => x.turn).filter(Boolean)).size
     const title = entryTitleOf(r.e)
@@ -992,7 +1017,7 @@ async function toolCompare(args = {}, idx) {
   const statsOf = sid => {
     const reqs = sortedReqs(idx.sessions[sid])
     if (!reqs.length) return null
-    const sc = scoreSession(reqs, reqs[reqs.length - 1].model)
+    const sc = scoreSession(reqs, reqs[reqs.length - 1].model, sid)
     const toolL = new Map()
     for (const r of reqs) for (const t of r.tools || []) toolL.set(t, (toolL.get(t) || 0) + 1)
     return {
@@ -1095,6 +1120,13 @@ async function toolInsights(args = {}, idx) {
     + (noCacheCost > 0 && totalCost != null ? ` · 缓存省钱 ${fmtUsd(noCacheCost - totalCost)}（无缓存等值 ${fmtUsd(noCacheCost)}，省 ${noCacheCost > 0 ? Math.round(100 * (1 - totalCost / noCacheCost)) : 0}%）` : ''))
   lines.push(`- 工具执行 ${fmtInt(sum(allReqs, r => (r.tools || []).length))} 次 · 模型耗时 ${fmtDur(modelMs)} · 活动跨度 ${fmtDur(spanMs)}（非模型时间约 ${fmtDur(Math.max(0, spanMs - modelMs))}）`)
   lines.push(`- 上下文压缩 ${fmtInt(compEvents)} 次（涉及 ${compSessions} 个会话）`)
+  // 辅助流量三分（v1.2）：后台搜索/标题生成/compact 等隐形请求单独可见
+  const auxRows = []
+  let auxN = 0, auxTok = 0
+  for (const r of rows) for (const x of r.reqs) {
+    if (reqClass(x, r.sid) === 'aux') { auxN++; auxTok += (x.in || 0) + (x.out || 0) }
+  }
+  if (auxN) lines.push(`- 辅助请求 ${fmtInt(auxN)} 次 · ${fmtTok(auxTok)} tok（后台搜索/标题生成/compact 等隐形流量，未计入健康度评分）`)
   lines.push('')
 
   // 模型分布
@@ -1373,6 +1405,7 @@ const TOOLS = [
       properties: {
         query: { type: 'string', description: '要搜索的子串或正则（必填）' },
         regex: { type: 'boolean', description: '把 query 当作 JavaScript 正则（Unicode 模式），默认 false' },
+        includeTools: { type: 'boolean', description: '同时搜索工具调用的输入（工具名+参数 JSON），默认 false' },
         range: { type: 'string', enum: ['today', '7d', '30d', 'all'], description: '扫描时间范围，默认 30d' },
         workspace: { type: 'string', description: '工作区路径前缀过滤' },
         limit: { type: 'number', description: '返回条数上限，默认 20，最大 50' },
@@ -1514,7 +1547,7 @@ rl.on('line', async line => {
       jsonrpc: '2.0', id, result: {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'context-insights', version: '1.1.0' },
+        serverInfo: { name: 'context-insights', version: '1.2.0' },
       },
     })
   } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
