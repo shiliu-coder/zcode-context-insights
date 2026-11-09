@@ -1329,6 +1329,8 @@ function serializeAggregate(a, idx) {
   const cutoff = RANGES[a.range] === Infinity ? 0 : Date.now() - RANGES[a.range] * 86400_000
   for (const [sid, e] of Object.entries(idx.sessions)) {
     if (a.wsFilter && !(e.workspace || '').startsWith(a.wsFilter)) continue
+    // 与 KPI 同口径：query 过滤（标题/工作区/id 子串）也要应用于健康度行
+    if (a.q && ![sid, e.title, e.workspace].join(' ').toLowerCase().includes(a.q)) continue
     const reqs = sortedReqs(e).filter(r => r.ts && Date.parse(r.ts) >= cutoff)
     if (reqs.length < 3) continue
     const sc = scoreSession(reqs, reqs[reqs.length - 1].model, sid)
@@ -1363,22 +1365,35 @@ function serializeAggregate(a, idx) {
   }
 }
 
-/** App 看板数据工具：页面每 5s callTool 刷新；app-only，不进对话。 */
+/** App 看板数据工具：页面每 5s callTool 刷新；app-only，不进对话。空数据也带 content 文本，保持 MCP 结果形状一致。 */
 async function toolDashboardData(args = {}, idx) {
   const a = collectInsights(args, idx)
-  if (a.empty) return { structuredContent: { range: a.range, kpi: { nSessions: 0, nSub: 0, nReqs: 0, inTok: 0, outTok: 0, cr: 0, totalCost: 0, noCacheCost: 0, compEvents: 0, compSessions: 0, auxN: 0, auxTok: 0, toolCalls: 0, modelMs: 0, spanMs: 0, unpriced: 0 }, models: [], wsTop: [], daily: [], hourly: new Array(24).fill(0), heat: [], top: [], health: [] } }
+  const emptyPayload = {
+    range: a.range,
+    kpi: { nSessions: 0, nSub: 0, nReqs: 0, inTok: 0, outTok: 0, cr: 0, totalCost: 0, noCacheCost: 0, compEvents: 0, compSessions: 0, auxN: 0, auxTok: 0, toolCalls: 0, modelMs: 0, spanMs: 0, unpriced: 0 },
+    models: [], wsTop: [], daily: [], hourly: new Array(24).fill(0), heat: [], top: [], health: [],
+  }
+  if (a.empty) {
+    return {
+      content: [{ type: 'text', text: `时间范围 ${a.range} 内没有请求记录。` }],
+      structuredContent: emptyPayload,
+    }
+  }
   return { structuredContent: serializeAggregate(a, idx) }
 }
 
-/** App 看板入口：普通可见工具，宿主打开 App 面板并投递初始数据。 */
+/** 看板面板实例 id：同一插件进程内稳定，宿主据此把工具结果绑定到打开的面板会话（showcase 同款）。 */
+const WIDGET_SESSION_ID = `context-insights-dashboard-${process.pid}`
+
+/** App 看板入口：fullscreen 偏好触发宿主把 ui:// 页面投进右侧面板（side pane）。 */
 async function toolDashboardShow(args = {}, idx) {
   const a = collectInsights(args, idx)
   const text = a.empty
     ? `时间范围 ${a.range} 内没有请求记录，看板无数据可显示。`
-    : `上下文洞察看板已在本 App 面板打开（${a.range}）。\n\n- 会话 ${a.rows.length} 个 · 请求 ${a.kpi.nReqs} 次 · token ${fmtTok(a.kpi.inTok + a.kpi.outTok)} · 成本 ${fmtUsd(a.kpi.totalCost)}（缓存省 ${a.kpi.noCacheCost > 0 ? Math.round(100 * (1 - a.kpi.totalCost / a.kpi.noCacheCost)) : 0}%）\n- 面板每 5 秒自动刷新；range/工作区过滤可在面板顶部切换。\n- 若当前宿主不支持 App 面板，可用 \`context_report\` 生成 HTML 报表替代。`
+    : `上下文看板已在右侧面板打开（${a.range}）。\n\n- 会话 ${a.rows.length} 个 · 请求 ${a.kpi.nReqs} 次 · token ${fmtTok(a.kpi.inTok + a.kpi.outTok)} · 成本 ${fmtUsd(a.kpi.totalCost)}（缓存省 ${a.kpi.noCacheCost > 0 ? Math.round(100 * (1 - a.kpi.totalCost / a.kpi.noCacheCost)) : 0}%）\n- 面板每 5 秒自动刷新；时间范围可在面板顶部切换。\n- 若当前宿主不支持 App 面板，可用 \`context_report\` 生成 HTML 报表替代。`
   return a.empty
-    ? { content: [{ type: 'text', text }] }
-    : { content: [{ type: 'text', text }], structuredContent: serializeAggregate(a, idx) }
+    ? { content: [{ type: 'text', text }], _meta: { 'openai/widgetSessionId': WIDGET_SESSION_ID } }
+    : { content: [{ type: 'text', text }], structuredContent: serializeAggregate(a, idx), _meta: { 'openai/widgetSessionId': WIDGET_SESSION_ID } }
 }
 
 /**
@@ -1664,7 +1679,7 @@ const TOOLS = [
   },
   {
     name: 'dashboard_show',
-    description: '打开实时上下文看板（MCP App）：在本插件的面板中显示 KPI/模型/工作区/每日/热力图/小时分布/会话榜/健康度排名，每 5 秒自动刷新。在 ZCode Desktop 中调用会打开 App 面板；不支持 App 的宿主会返回文本说明。',
+    description: '在右侧面板打开实时上下文看板（dsh-context 右栏 Context 面板的 ZCode 等价物）：KPI/模型/工作区/每日/热力图/小时分布/会话榜/健康度排名，每 5 秒自动刷新，面板内可切时间范围。在 ZCode Desktop 中调用即自动弹出侧栏面板；不支持 App 面板的宿主返回文本降级。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1673,7 +1688,15 @@ const TOOLS = [
         query: { type: 'string', description: '会话标题/工作区/id 子串过滤' },
       },
     },
-    _meta: { ui: { resourceUri: 'ui://context-insights/dashboard.html' } },
+    // 侧栏面板配方（取自 showcase open_editor）：fullscreen 偏好让宿主把 resourceUri 页面投进 side pane
+    _meta: {
+      ui: {
+        resourceUri: 'ui://context-insights/dashboard.html',
+        visibility: ['model', 'app'],
+        csp: { connectDomains: [], resourceDomains: [] },
+      },
+      'openai/ui': { preferredModelDisplayMode: 'fullscreen' },
+    },
   },
   {
     name: 'dashboard_data',
@@ -1764,7 +1787,7 @@ rl.on('line', async line => {
       jsonrpc: '2.0', id, result: {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {}, resources: { subscribe: false, listChanged: false } },
-        serverInfo: { name: 'context-insights', version: '1.4.0' },
+        serverInfo: { name: 'context-insights', version: '1.5.0' },
       },
     })
   } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
@@ -1787,6 +1810,9 @@ rl.on('line', async line => {
     } else {
       send({ jsonrpc: '2.0', id, error: { code: -32002, message: `未知资源: ${uri}` } })
     }
+  } else if (method === 'resources/subscribe' || method === 'resources/unsubscribe') {
+    // 宿主（如按 showcase 模式）可能订阅资源；我们声明不支持订阅，温和应答空结果而非报错
+    send({ jsonrpc: '2.0', id, result: {} })
   } else if (method === 'tools/list') {
     send({ jsonrpc: '2.0', id, result: { tools: TOOLS } })
   } else if (method === 'tools/call') {

@@ -40,12 +40,12 @@ th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabu
   var body = document.getElementById("body")
   var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] }) }
   function post(msg) { if (shellOrigin == null) return; window.parent.postMessage(msg, shellOrigin) }
-  function request(method, params) {
+  function request(method, params, timeoutMs) {
     return new Promise(function (resolve, reject) {
       var id = seq++
       pending.set(id, { resolve: resolve, reject: reject })
       post({ jsonrpc: "2.0", id: id, method: method, params: params })
-      setTimeout(function () { if (pending.has(id)) { pending.delete(id); reject(new Error("timeout")) } }, 30000)
+      setTimeout(function () { if (pending.has(id)) { pending.delete(id); reject(new Error("timeout")) } }, timeoutMs || 30000)
     })
   }
   function notify(method, params) { post({ jsonrpc: "2.0", method: method, params: params }) }
@@ -78,6 +78,11 @@ th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabu
   }
   function render(d) {
     var k = d.kpi
+    if (!k.nSessions) {
+      body.innerHTML = "<div class='empty'>该时间范围内没有请求记录——切换上方时间范围，或先在 ZCode 里跑几轮对话。</div>"
+      document.getElementById("updated").textContent = "空数据 · " + new Date().toLocaleTimeString()
+      return
+    }
     var hit = k.inTok ? (100 * k.cr / k.inTok).toFixed(1) + "%" : "N/A"
     var save = k.noCacheCost > 0 && k.totalCost != null ? Math.round(100 * (1 - k.totalCost / k.noCacheCost)) : 0
     var h = '<div class="kpi">'
@@ -125,12 +130,26 @@ th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabu
     body.innerHTML = h
     document.getElementById("updated").textContent = "最后更新 " + new Date().toLocaleTimeString() + " · 自动刷新中"
   }
+  // 取数失败保留已渲染内容，只在状态行提示——瞬时错误不清空整版
+  var errStreak = 0
   function refresh() {
     callTool("dashboard_data", { range: range }).then(function (result) {
       var d = dataOf(result)
-      if (d) render(d)
-      else body.innerHTML = "<div class='empty'>取数失败：" + esc(JSON.stringify(result).slice(0, 120)) + "</div>"
-    }).catch(function (e) { body.innerHTML = "<div class='empty'>取数失败：" + esc(e.message) + "</div>" })
+      if (d) {
+        render(d)
+        errStreak = 0
+      } else {
+        errStreak++
+        note("取数异常（结果缺少数据）" + (errStreak > 1 ? " · 第 " + errStreak + " 次" : ""))
+      }
+    }).catch(function (e) {
+      errStreak++
+      note("取数失败：" + e.message + (errStreak > 1 ? " · 连续 " + errStreak + " 次" : "") + "，保留上次内容")
+    })
+  }
+  function note(msg) {
+    var el = document.getElementById("updated")
+    el.textContent = "⚠ " + msg + " · " + new Date().toLocaleTimeString()
   }
   function drawTabs() {
     var el = document.getElementById("tabs")
@@ -142,16 +161,22 @@ th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabu
       b.onclick = function () { range = r0; drawTabs(); refresh() }
       el.appendChild(b)
     })
+    var manual = document.createElement("button")
+    manual.textContent = "↻ 刷新"
+    manual.setAttribute("data-on", "0")
+    manual.onclick = function () { errStreak = 0; refresh() }
+    el.appendChild(manual)
   }
   function boot() {
     drawTabs()
     refresh()
     setInterval(refresh, 5000)
   }
-  // MCP App 握手：ui/initialize → initialized；宿主响应后开始取数
-  request("ui/initialize", { appInfo: { name: "context-insights-dashboard", version: "1.4.0" }, appCapabilities: {}, protocolVersion: "1.0" })
+  // MCP App 握手：ui/initialize → initialized；宿主响应后开始取数。
+  // 非 App 环境（浏览器直开等）无桥——5 秒快速降级到静态提示，不白等
+  request("ui/initialize", { appInfo: { name: "context-insights-dashboard", version: "1.5.0" }, appCapabilities: {}, protocolVersion: "1.0" }, 5000)
     .then(function () { notify("ui/notifications/initialized", {}); boot() })
-    .catch(function () { /* 非 App 宿主（如终端预览）：无桥，静态提示 */ body.innerHTML = "<div class='empty'>此环境未提供 App 桥（如终端）。在 ZCode Desktop 中调用 dashboard_show 打开实时看板。</div>" })
+    .catch(function () { body.innerHTML = "<div class='empty'>此环境未提供 App 桥（如终端或浏览器直开）。在 ZCode Desktop 会话中调用 dashboard_show 打开实时看板；离线场景可用 context_report 生成 HTML 报表。</div>" })
 })()
 </script>
 </body>

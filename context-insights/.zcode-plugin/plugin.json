@@ -1,6 +1,6 @@
 {
   "name": "context-insights",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Context composition, per-request trend, cost estimates and cross-session usage insights read from local ZCode model-IO rollout logs — a ZCode port of the dsh-context data layer.",
   "author": { "name": "shiliu_7893" },
   "mcpServers": "./.mcp.json",

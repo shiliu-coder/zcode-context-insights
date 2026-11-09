@@ -88,3 +88,4 @@ rollout 历史可达数十 GB。首次调用 `context_trend`/`context_insights`/
 | 1.0.0 | 里程碑：`context_compare` 会话对比、`session_digest` 批量速览（recent:N）、`/weekly` 周报命令；真机 dogfood 验证（60s 刷新在生产会话生效）。14 工具 + 4 命令，功能面收敛 |
 | 1.2.0 | 流量三分与搜索修复：索引 v3 记录 querySource，请求三分（主对话/子 agent/辅助），**健康度评分剔除辅助流**（修复背景小请求拉爆缓存分的评分冤案）；insights 辅助流量 KPI；`context_search` `includeTools`（工具调用输入，稳定分区优先）+ **候选按文件大小升序**（修复巨文件烧光预算饿死小文件）；索引向下兼容（版本升级不再触发全量重建风暴）+ 无 qs 小文件一次性补扫 |
 | 1.3.0 | 可视化：`context_report` 单文件 HTML 报表（KPI 卡/每日柱/热力图/小时分布/健康度排名，深色零外部资源）；insights 聚合逻辑抽为 `collectInsights` 共享层（Markdown/HTML 双渲染，输出逐字节不变） |
+| 1.4.0 | **MCP App 实时看板**：server 声明 `ui://context-insights/dashboard.html` 资源，`dashboard_show` 在 ZCode Desktop 的 App 面板打开看板（每 5 秒 `dashboard_data` 自动刷新，app-only 不进对话）；页面手写 postMessage JSON-RPC（ui/initialize 握手），零依赖；`tools/call` 支持结构化输出。**18 工具 + 4 命令** |

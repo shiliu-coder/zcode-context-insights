@@ -59,6 +59,9 @@ test('MCP 握手 + 工具清单 + 真实数据调用 + 搜索 includeTools + 未
     { jsonrpc: '2.0', id: 8, method: 'resources/list' },
     { jsonrpc: '2.0', id: 9, method: 'resources/read', params: { uri: 'ui://context-insights/dashboard.html' } },
     { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'dashboard_data', arguments: { range: 'all' } } },
+    { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'dashboard_data', arguments: { range: 'today', query: '不存在的关键词xyzzy' } } },
+    { jsonrpc: '2.0', id: 12, method: 'resources/subscribe', params: { uri: 'ui://context-insights/dashboard.html' } },
+    { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'dashboard_show', arguments: { range: 'all' } } },
     { jsonrpc: '2.0', id: 6, method: 'bogus/method', params: {} },
   ])
   const byId = Object.fromEntries(out.map(m => [m.id, m]))
@@ -83,6 +86,21 @@ test('MCP 握手 + 工具清单 + 真实数据调用 + 搜索 includeTools + 未
   const dd = byId[10].result
   assert.ok(dd.structuredContent?.kpi?.nSessions >= 1, `dashboard_data 应返回 structuredContent.kpi：${JSON.stringify(dd.structuredContent?.kpi).slice(0, 120)}`)
   assert.ok(Array.isArray(dd.structuredContent.models))
+  // 空数据分支：形状一致（content 文本 + structuredContent.kpi 归零），不让宿主拿到缺字段的结果
+  const de = byId[11].result
+  assert.ok(Array.isArray(de.content) && typeof de.content[0].text === 'string', '空数据也应带 content 文本')
+  assert.equal(de.structuredContent?.kpi?.nSessions, 0)
+  assert.ok(Array.isArray(de.structuredContent.health) && Array.isArray(de.structuredContent.heat))
+  // 宿主订阅资源：温和空应答而非 -32601
+  assert.deepEqual(byId[12].result, {})
+  // 侧栏面板配方（showcase open_editor 同款）：fullscreen 偏好 + widgetSessionId 绑定
+  const showTool = byId[2].result.tools.find(t => t.name === 'dashboard_show')
+  assert.equal(showTool?._meta?.['openai/ui']?.preferredModelDisplayMode, 'fullscreen', 'dashboard_show 应声明 fullscreen 侧栏偏好')
+  assert.ok(showTool?._meta?.ui?.resourceUri === 'ui://context-insights/dashboard.html')
+  assert.deepEqual(showTool?._meta?.ui?.visibility, ['model', 'app'])
+  const show = byId[13].result
+  assert.ok(show._meta?.['openai/widgetSessionId'], 'dashboard_show 结果应带 widgetSessionId')
+  assert.ok(show.structuredContent?.kpi?.nSessions >= 1)
   const dashTool = byId[2].result.tools.find(t => t.name === 'dashboard_data')
   assert.ok(dashTool?._meta?.ui?.visibility?.[0] === 'app', 'dashboard_data 应为 app-only')
   assert.equal(byId[6].error.code, -32601)
