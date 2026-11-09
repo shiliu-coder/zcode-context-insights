@@ -1,11 +1,18 @@
 // context-insights MCP server：stdio JSON-RPC（MCP 协议），零依赖 Node ESM。
 // 数据源为本地 ZCode rollout 日志，不做任何网络请求；价格表见 pricing-builtin.json。
 import readline from 'node:readline'
-import { mkdirSync, writeFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, writeFileSync, statSync, readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { listSessions, resolveSession, updateIndex, tailLastLine, readLineAt, searchSessionFile } from './lib/rollout.mjs'
 import { composeFromRequest } from './lib/compose.mjs'
 import { estimateCostUsd, isPlanProvider, priceFor, configDir, contextLimitFor } from './lib/pricing.mjs'
+import { fileURLToPath } from 'node:url'
+
+const moduleDir = dirname(fileURLToPath(import.meta.url))
+const DASHBOARD_URI = 'ui://context-insights/dashboard.html'
+const dashboardHtml = (() => {
+  try { return readFileSync(join(moduleDir, 'ui', 'dashboard.html'), 'utf8') } catch { return '<html><body>看板页面缺失（安装不完整）</body></html>' }
+})()
 
 // ---------- 格式化 ----------
 
@@ -1316,6 +1323,64 @@ async function toolInsights(args = {}, idx) {
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 
+/** 聚合结果 → JSON 安全对象（App 看板 structuredContent 用；含健康度最差 10）。 */
+function serializeAggregate(a, idx) {
+  const health = []
+  const cutoff = RANGES[a.range] === Infinity ? 0 : Date.now() - RANGES[a.range] * 86400_000
+  for (const [sid, e] of Object.entries(idx.sessions)) {
+    if (a.wsFilter && !(e.workspace || '').startsWith(a.wsFilter)) continue
+    const reqs = sortedReqs(e).filter(r => r.ts && Date.parse(r.ts) >= cutoff)
+    if (reqs.length < 3) continue
+    const sc = scoreSession(reqs, reqs[reqs.length - 1].model, sid)
+    if (sc.total == null) continue
+    health.push({ sid: shortSid(sid), sub: isSub(sid), total: sc.total, grade: gradeOf(sc.total), cache: sc.parts.cache?.score ?? null, win: sc.parts.window?.score ?? null, comp: sc.parts.compaction?.score ?? null, eff: sc.parts.efficiency?.score ?? null })
+  }
+  health.sort((x, y) => x.total - y.total)
+  // 8 周热力图格子 [日期, 级别0-4]
+  const maxDayTok = Math.max(...[...a.daily.values()].map(d => d.tok), 1)
+  const lastDay = [...a.daily.keys()].sort().pop()
+  const heat = []
+  if (lastDay) {
+    const cursor = new Date(lastDay + 'T00:00:00')
+    cursor.setDate(cursor.getDate() - 55)
+    for (let i = 0; i < 56; i++) {
+      const key = localDayKey(cursor)
+      const t = a.daily.get(key)?.tok
+      heat.push([key, t == null ? 0 : Math.min(4, 1 + Math.floor(4 * t / maxDayTok))])
+      cursor.setDate(cursor.getDate() + 1)
+    }
+  }
+  return {
+    range: a.range,
+    kpi: a.kpi,
+    models: a.models.map(([m, d]) => [m, { n: d.n, in: d.in, out: d.out, cr: d.cr, cost: d.cost }]),
+    wsTop: a.wsTop.map(([ws, d]) => [wsDisplay(ws), d]),
+    daily: a.days7.map(([day, d]) => [day, { tok: d.tok, cost: d.cost }]),
+    hourly: a.hourly,
+    heat,
+    top: a.top.map(t => ({ sid: shortSid(t.sid), sub: isSub(t.sid), ws: t.workspace, n: t.n, tok: t.tok, cost: t.cost, last: t.last })),
+    health: health.slice(0, 10),
+  }
+}
+
+/** App 看板数据工具：页面每 5s callTool 刷新；app-only，不进对话。 */
+async function toolDashboardData(args = {}, idx) {
+  const a = collectInsights(args, idx)
+  if (a.empty) return { structuredContent: { range: a.range, kpi: { nSessions: 0, nSub: 0, nReqs: 0, inTok: 0, outTok: 0, cr: 0, totalCost: 0, noCacheCost: 0, compEvents: 0, compSessions: 0, auxN: 0, auxTok: 0, toolCalls: 0, modelMs: 0, spanMs: 0, unpriced: 0 }, models: [], wsTop: [], daily: [], hourly: new Array(24).fill(0), heat: [], top: [], health: [] } }
+  return { structuredContent: serializeAggregate(a, idx) }
+}
+
+/** App 看板入口：普通可见工具，宿主打开 App 面板并投递初始数据。 */
+async function toolDashboardShow(args = {}, idx) {
+  const a = collectInsights(args, idx)
+  const text = a.empty
+    ? `时间范围 ${a.range} 内没有请求记录，看板无数据可显示。`
+    : `上下文洞察看板已在本 App 面板打开（${a.range}）。\n\n- 会话 ${a.rows.length} 个 · 请求 ${a.kpi.nReqs} 次 · token ${fmtTok(a.kpi.inTok + a.kpi.outTok)} · 成本 ${fmtUsd(a.kpi.totalCost)}（缓存省 ${a.kpi.noCacheCost > 0 ? Math.round(100 * (1 - a.kpi.totalCost / a.kpi.noCacheCost)) : 0}%）\n- 面板每 5 秒自动刷新；range/工作区过滤可在面板顶部切换。\n- 若当前宿主不支持 App 面板，可用 \`context_report\` 生成 HTML 报表替代。`
+  return a.empty
+    ? { content: [{ type: 'text', text }] }
+    : { content: [{ type: 'text', text }], structuredContent: serializeAggregate(a, idx) }
+}
+
 /**
  * HTML 报表（对标 ccusage 的可视化，单文件零依赖）：复用 collectInsights 聚合层，
  * 写 exports/，含 KPI/模型/工作区/每日柱状/小时分布/热力图/会话榜/健康度排名。
@@ -1598,6 +1663,32 @@ const TOOLS = [
     },
   },
   {
+    name: 'dashboard_show',
+    description: '打开实时上下文看板（MCP App）：在本插件的面板中显示 KPI/模型/工作区/每日/热力图/小时分布/会话榜/健康度排名，每 5 秒自动刷新。在 ZCode Desktop 中调用会打开 App 面板；不支持 App 的宿主会返回文本说明。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        range: { type: 'string', enum: ['today', '7d', '30d', 'all'], description: '初始时间范围，默认 7d' },
+        workspace: { type: 'string', description: '工作区路径前缀过滤' },
+        query: { type: 'string', description: '会话标题/工作区/id 子串过滤' },
+      },
+    },
+    _meta: { ui: { resourceUri: 'ui://context-insights/dashboard.html' } },
+  },
+  {
+    name: 'dashboard_data',
+    description: '看板数据源（app-only）：返回聚合 JSON（structuredContent）。由看板页面自动调用，不应在普通对话中调用。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        range: { type: 'string', enum: ['today', '7d', '30d', 'all'], description: '统计时间范围，默认 7d' },
+        workspace: { type: 'string', description: '工作区路径前缀过滤' },
+        query: { type: 'string', description: '会话标题/工作区/id 子串过滤' },
+      },
+    },
+    _meta: { ui: { visibility: ['app'] } },
+  },
+  {
     name: 'pricing_info',
     description: '当前生效的价格表（内置 + 自动层 + 用户覆盖合并后）、计费口径说明与覆盖方法。',
     inputSchema: { type: 'object', properties: {} },
@@ -1651,6 +1742,8 @@ async function dispatch(name, args) {
     case 'context_health': return toolHealth(args, await ensureIndex())
     case 'session_digest': return toolDigest(args, await ensureIndex())
     case 'context_compare': return toolCompare(args, await ensureIndex())
+    case 'dashboard_show': return toolDashboardShow(args, await ensureIndex())
+    case 'dashboard_data': return toolDashboardData(args, await ensureIndex())
     case 'pricing_info': return toolPricingInfo()
     case 'pricing_refresh': return toolPricingRefresh()
     default: throw new Error(`未知工具: ${name}`)
@@ -1670,20 +1763,38 @@ rl.on('line', async line => {
     send({
       jsonrpc: '2.0', id, result: {
         protocolVersion: params?.protocolVersion || '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'context-insights', version: '1.3.0' },
+        capabilities: { tools: {}, resources: { subscribe: false, listChanged: false } },
+        serverInfo: { name: 'context-insights', version: '1.4.0' },
       },
     })
   } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
     // 通知无需应答
   } else if (method === 'ping') {
     send({ jsonrpc: '2.0', id, result: {} })
+  } else if (method === 'resources/list') {
+    send({
+      jsonrpc: '2.0', id, result: {
+        resources: [{
+          uri: DASHBOARD_URI, name: 'dashboard', mimeType: 'text/html',
+          description: 'Context Insights 实时看板（MCP App 页面）：KPI/模型/工作区/每日/热力图/小时/会话榜/健康度，5 秒自动刷新',
+        }],
+      },
+    })
+  } else if (method === 'resources/read') {
+    const uri = params?.uri
+    if (uri === DASHBOARD_URI) {
+      send({ jsonrpc: '2.0', id, result: { contents: [{ uri, mimeType: 'text/html', text: dashboardHtml }] } })
+    } else {
+      send({ jsonrpc: '2.0', id, error: { code: -32002, message: `未知资源: ${uri}` } })
+    }
   } else if (method === 'tools/list') {
     send({ jsonrpc: '2.0', id, result: { tools: TOOLS } })
   } else if (method === 'tools/call') {
     try {
-      const text = await dispatch(params?.name, params?.arguments || {})
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } })
+      const out = await dispatch(params?.name, params?.arguments || {})
+      // 字符串返回值 → 纯文本结果；对象返回值（如 {content, structuredContent}）→ 原样作为 result（MCP App 结构化输出）
+      if (typeof out === 'string') send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: out }] } })
+      else send({ jsonrpc: '2.0', id, result: out })
     } catch (err) {
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `工具执行失败：${err.message}` }], isError: true } })
     }

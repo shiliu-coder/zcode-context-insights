@@ -15,6 +15,7 @@ dsh-context 的 ZCode 版数据层移植：读取本地 ZCode 模型 IO 日志�
 | `context_insights(range?, workspace?, query?, brief?)` | 跨会话 KPI（含**缓存省钱额**、**压缩事件计数**）、模型分布、**工作区分布**、会话榜；`brief: true` 精简输出（跳过每日柱/热力图/小时分布/四账本）——默认完整。可按工作区前缀与关键词过滤。 |
 | `context_search(query, regex?, range?, workspace?, limit?)` | **跨会话全文搜索**：在用户消息/助手回复/工具结果中按子串或正则（`regex: true`）查找，返回会话、时间、片段与 `request=-N`（可直接传 `context_composition` 跳转该请求）。命中行才解析、重复内容去重；扫描字节上限 `CONTEXT_INSIGHTS_SEARCH_MAX_BYTES`（默认 4GB）。 |
 | `context_export(kind?, range?, workspace?, query?)` | **CSV 导出**：`sessions`（会话汇总：token/成本/压缩次数/峰值）或 `requests`（逐请求明细）到 `~/.zcode/context-insights/exports/`；带 BOM，Excel/Numbers 直接打开。 |
+| `context_report(range?, workspace?, query?)` | **单文件 HTML 报表**（对标 ccusage 可视化）：KPI 卡片、模型/工作区分布、每日柱状、8 周热力图、小时分布、会话榜、健康度最差排名；深色主题、零外部资源，写 `exports/` 后浏览器打开即看。 |
 | `context_health(session?, range?, workspace?, limit?)` | **会话健康度评分**：缓存效率 35% / 窗口纪律 25% / 压缩频率 20% / 成本效率 20%（启发式，数据不足的维度权重重分配），低分维度附改进建议；传 session 单会话诊断，省略则输出范围内**排名**（最差前 N 优先治理 + 最优前 3）。 |
 | `session_digest(session?, recent?)` | **会话速览**：一段话回答"这个会话干了啥"——标题/跨度/轮次/token/成本/压缩/健康度/子 agent，加常用工具、触碰文件（读/写）、常跑命令与最后一条用户消息。`recent: N` 批量输出最近 N 个主会话的紧凑速览（每会话 2-3 行）。 |
 | `context_compare(sessionA?, sessionB?)` | **会话对比**：两个会话的指标并排表（跨度/轮次/token/命中率/峰值/压缩/成本/健康度/子 agent/常用工具）；缺省取两个最近活跃的主会话。 |
@@ -86,3 +87,4 @@ rollout 历史可达数十 GB。首次调用 `context_trend`/`context_insights`/
 | 0.9.1 | 运行日志与代码审计修复：索引每 60s 自动增量刷新（修复长会话数据陈旧）、并发落盘合并（session 隔离下多 server 写同一索引）、耗时显示 fmtDur（消除 "Ms" 歧义）、父归属按启动时间序、CSV 公式注入防护、实况描述截断 |
 | 1.0.0 | 里程碑：`context_compare` 会话对比、`session_digest` 批量速览（recent:N）、`/weekly` 周报命令；真机 dogfood 验证（60s 刷新在生产会话生效）。14 工具 + 4 命令，功能面收敛 |
 | 1.2.0 | 流量三分与搜索修复：索引 v3 记录 querySource，请求三分（主对话/子 agent/辅助），**健康度评分剔除辅助流**（修复背景小请求拉爆缓存分的评分冤案）；insights 辅助流量 KPI；`context_search` `includeTools`（工具调用输入，稳定分区优先）+ **候选按文件大小升序**（修复巨文件烧光预算饿死小文件）；索引向下兼容（版本升级不再触发全量重建风暴）+ 无 qs 小文件一次性补扫 |
+| 1.3.0 | 可视化：`context_report` 单文件 HTML 报表（KPI 卡/每日柱/热力图/小时分布/健康度排名，深色零外部资源）；insights 聚合逻辑抽为 `collectInsights` 共享层（Markdown/HTML 双渲染，输出逐字节不变） |

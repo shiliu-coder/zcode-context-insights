@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Context Insights 看板</title>
+<style>
+:root{color-scheme:dark}
+body{font:13px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;padding:16px 18px;background:#0f1117;color:#d8d9dd}
+h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:18px 0 8px;color:#9db9f5;border-left:3px solid #5b8def;padding-left:8px}
+.sub{color:#8a8f98;font-size:12px;margin-bottom:12px}
+.tabs{margin:0 0 14px}.tabs button{background:#181b25;color:#d8d9dd;border:1px solid #262a35;border-radius:6px;padding:4px 14px;margin-right:6px;cursor:pointer;font:inherit}
+.tabs button[data-on="1"]{background:#2c5bbd;border-color:#5b8def;color:#fff}
+.kpi{display:flex;flex-wrap:wrap;gap:8px}.kpi div{background:#181b25;border-radius:8px;padding:8px 14px;min-width:120px}
+.kpi b{display:block;font-size:17px;color:#fff}.kpi span{color:#8a8f98;font-size:11px}
+table{border-collapse:collapse;width:100%;margin:6px 0}th,td{padding:4px 8px;border-bottom:1px solid #262a35;text-align:left;font-size:12px}
+th{color:#8a8f98;font-weight:500}.num{text-align:right;font-variant-numeric:tabular-nums}
+.chart{display:flex;align-items:flex-end;gap:3px;height:90px}.col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;flex:1;min-width:0}
+.colbar{background:#5b8def;border-radius:2px 2px 0 0;width:70%}.col span{font-size:9px;color:#8a8f98;margin-top:2px;white-space:nowrap;overflow:hidden;max-width:100%}
+.heat{display:grid;grid-template-columns:repeat(28,11px);gap:2px}.heat i{width:11px;height:11px;border-radius:2px;background:#1d2029}
+.h1{background:#1d3a6b}.h2{background:#2c5bbd}.h3{background:#5b8def}.h4{background:#9db9f5}
+.updated{color:#8a8f98;font-size:11px;margin-top:14px}
+.empty{color:#8a8f98;padding:24px 0}
+</style>
+</head>
+<body>
+<h1>Context Insights 实时看板</h1>
+<div class="sub">本地模型 IO 日志 · 每 5 秒自动刷新 · 数据不离开本机</div>
+<div class="tabs" id="tabs"></div>
+<div id="body"><div class="empty">初始化中…</div></div>
+<div class="updated" id="updated"></div>
+<script>
+(function () {
+  // 宿主 shell 桥：origin 约定 plugin- 前缀换成 shell-（与 showcase 一致的宿主实现）
+  var shellOrigin = null
+  try { shellOrigin = location.origin.replace("://plugin-", "://shell-") } catch (e) {}
+  var seq = 1
+  var pending = new Map()
+  var range = "7d"
+  var RANGES = ["today", "7d", "30d", "all"]
+  var body = document.getElementById("body")
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] }) }
+  function post(msg) { if (shellOrigin == null) return; window.parent.postMessage(msg, shellOrigin) }
+  function request(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = seq++
+      pending.set(id, { resolve: resolve, reject: reject })
+      post({ jsonrpc: "2.0", id: id, method: method, params: params })
+      setTimeout(function () { if (pending.has(id)) { pending.delete(id); reject(new Error("timeout")) } }, 30000)
+    })
+  }
+  function notify(method, params) { post({ jsonrpc: "2.0", method: method, params: params }) }
+  function callTool(name, args) { return request("tools/call", { name: name, arguments: args || {} }) }
+  window.addEventListener("message", function (event) {
+    if (shellOrigin != null && (event.source !== window.parent || event.origin !== shellOrigin)) return
+    var m = event.data
+    if (!m || m.jsonrpc !== "2.0") return
+    if (m.id !== undefined && pending.has(m.id)) {
+      var w = pending.get(m.id)
+      pending.delete(m.id)
+      m.error ? w.reject(new Error(m.error.message || "server error")) : w.resolve(m.result)
+    }
+  })
+  function fmtTok(n) {
+    if (n == null) return "N/A"
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M"
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"
+    return String(Math.round(n))
+  }
+  function fmtUsd(n) { return n == null ? "N/A" : "$" + (n > 0 && n < 0.01 ? n.toFixed(4) : n.toFixed(2)) }
+  function fmtInt(n) { return n == null ? "N/A" : String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",") }
+  function wsDisp(p) { if (!p) return "-"; var t = String(p).replace(/^\/Users\/[^/]+/, "~").replace(/\/+$/, ""); if (t.length <= 48) return t; var s = t.split("/"); return s[0] + "/…/" + s[s.length - 1] }
+  function fmtDate(ts) { if (!ts) return "-"; var d = new Date(ts); return isNaN(d) ? String(ts) : d.getMonth() + 1 + "-" + d.getDate() + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") }
+  // 取数：structuredContent（dashboard_data 的输出）；兼容 content 文本兜底
+  function dataOf(result) {
+    if (!result) return null
+    if (result.structuredContent && result.structuredContent.kpi) return result.structuredContent
+    return null
+  }
+  function render(d) {
+    var k = d.kpi
+    var hit = k.inTok ? (100 * k.cr / k.inTok).toFixed(1) + "%" : "N/A"
+    var save = k.noCacheCost > 0 && k.totalCost != null ? Math.round(100 * (1 - k.totalCost / k.noCacheCost)) : 0
+    var h = '<div class="kpi">'
+    h += "<div><b>" + fmtInt(k.nSessions) + "</b><span>会话（子 " + k.nSub + "）</span></div>"
+    h += "<div><b>" + fmtInt(k.nReqs) + "</b><span>请求</span></div>"
+    h += "<div><b>" + fmtTok(k.inTok + k.outTok) + "</b><span>token</span></div>"
+    h += "<div><b>" + fmtUsd(k.totalCost) + "</b><span>成本" + (save ? " · 缓存省 " + save + "%" : "") + "</span></div>"
+    h += "<div><b>" + hit + "</b><span>缓存命中率</span></div>"
+    h += "<div><b>" + fmtInt(k.compEvents) + "</b><span>压缩</span></div>"
+    if (k.auxN) h += "<div><b>" + fmtTok(k.auxTok) + "</b><span>辅助流量（" + k.auxN + "）</span></div>"
+    h += "</div>"
+    h += "<h2>模型分布</h2><table><tr><th>模型</th><th>请求</th><th>输入</th><th>输出</th><th>成本</th></tr>"
+    d.models.forEach(function (row) { h += "<tr><td>" + esc(row[0] || "N/A") + "</td><td class='num'>" + row[1].n + "</td><td class='num'>" + fmtTok(row[1].in) + "</td><td class='num'>" + fmtTok(row[1].out) + "</td><td class='num'>" + fmtUsd(row[1].cost) + "</td></tr>" })
+    h += "</table>"
+    h += "<h2>工作区分布</h2><table><tr><th>工作区</th><th>会话</th><th>token</th><th>成本</th></tr>"
+    d.wsTop.forEach(function (row) { h += "<tr><td>" + esc(row[0]) + "</td><td class='num'>" + row[1].sessions + "</td><td class='num'>" + fmtTok(row[1].tok) + "</td><td class='num'>" + fmtUsd(row[1].cost) + "</td></tr>" })
+    h += "</table>"
+    if (d.daily && d.daily.length) {
+      var maxD = 1
+      d.daily.forEach(function (p) { if (p[1].tok > maxD) maxD = p[1].tok })
+      h += "<h2>每日用量</h2><div class='chart'>"
+      d.daily.forEach(function (p) { h += "<div class='col' title='" + esc(p[0]) + " · " + fmtTok(p[1].tok) + "'><div class='colbar' style='height:" + Math.max(2, Math.round(80 * p[1].tok / maxD)) + "px'></div><span>" + esc(p[0].slice(5)) + "</span></div>" })
+      h += "</div>"
+    }
+    if (d.heat && d.heat.length) {
+      h += "<h2>活动热力图（近 8 周）</h2><div class='heat'>"
+      d.heat.forEach(function (c) { h += "<i class='" + (c[1] ? "h" + c[1] : "") + "' title='" + esc(c[0]) + "'></i>" })
+      h += "</div>"
+    }
+    if (d.hourly && d.hourly.some(function (v) { return v > 0 })) {
+      var maxH = 1
+      d.hourly.forEach(function (v) { if (v > maxH) maxH = v })
+      h += "<h2>小时分布</h2><div class='chart'>"
+      d.hourly.forEach(function (v, hr) { h += "<div class='col' title='" + hr + ":00 · " + fmtTok(v) + "'><div class='colbar' style='height:" + Math.max(2, Math.round(80 * v / maxH)) + "px;background:#3ecf8e'></div><span>" + hr + "</span></div>" })
+      h += "</div>"
+    }
+    h += "<h2>会话榜</h2><table><tr><th>会话</th><th>工作区</th><th>请求</th><th>token</th><th>成本</th><th>最近</th></tr>"
+    d.top.forEach(function (t) { h += "<tr><td>" + esc(t.sid) + (t.sub ? "（子）" : "") + "</td><td>" + esc(wsDisp(t.ws)) + "</td><td class='num'>" + t.n + "</td><td class='num'>" + fmtTok(t.tok) + "</td><td class='num'>" + fmtUsd(t.cost) + "</td><td>" + esc(fmtDate(t.last)) + "</td></tr>" })
+    h += "</table>"
+    if (d.health && d.health.length) {
+      h += "<h2>健康度最差前 10</h2><table><tr><th>会话</th><th>总分</th><th>缓存</th><th>窗口</th><th>压缩</th><th>成本效率</th></tr>"
+      d.health.forEach(function (r0) { h += "<tr><td>" + esc(r0.sid) + (r0.sub ? "（子）" : "") + "</td><td>" + r0.total + "（" + esc(r0.grade) + "）</td><td>" + (r0.cache == null ? "-" : r0.cache) + "</td><td>" + (r0.win == null ? "-" : r0.win) + "</td><td>" + (r0.comp == null ? "-" : r0.comp) + "</td><td>" + (r0.eff == null ? "-" : r0.eff) + "</td></tr>" })
+      h += "</table>"
+    }
+    body.innerHTML = h
+    document.getElementById("updated").textContent = "最后更新 " + new Date().toLocaleTimeString() + " · 自动刷新中"
+  }
+  function refresh() {
+    callTool("dashboard_data", { range: range }).then(function (result) {
+      var d = dataOf(result)
+      if (d) render(d)
+      else body.innerHTML = "<div class='empty'>取数失败：" + esc(JSON.stringify(result).slice(0, 120)) + "</div>"
+    }).catch(function (e) { body.innerHTML = "<div class='empty'>取数失败：" + esc(e.message) + "</div>" })
+  }
+  function drawTabs() {
+    var el = document.getElementById("tabs")
+    el.innerHTML = ""
+    RANGES.forEach(function (r0) {
+      var b = document.createElement("button")
+      b.textContent = r0
+      b.setAttribute("data-on", r0 === range ? "1" : "0")
+      b.onclick = function () { range = r0; drawTabs(); refresh() }
+      el.appendChild(b)
+    })
+  }
+  function boot() {
+    drawTabs()
+    refresh()
+    setInterval(refresh, 5000)
+  }
+  // MCP App 握手：ui/initialize → initialized；宿主响应后开始取数
+  request("ui/initialize", { appInfo: { name: "context-insights-dashboard", version: "1.4.0" }, appCapabilities: {}, protocolVersion: "1.0" })
+    .then(function () { notify("ui/notifications/initialized", {}); boot() })
+    .catch(function () { /* 非 App 宿主（如终端预览）：无桥，静态提示 */ body.innerHTML = "<div class='empty'>此环境未提供 App 桥（如终端）。在 ZCode Desktop 中调用 dashboard_show 打开实时看板。</div>" })
+})()
+</script>
+</body>
+</html>
